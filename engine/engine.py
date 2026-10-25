@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import torch
 
 from engine.config import EngineConfig
-from engine.kv_cache import SingleSequenceKVCache, SlotKVCache
+from engine.kv_cache import PagedKVCache, SingleSequenceKVCache, SlotKVCache
 from engine.loader import load_eos_token_ids, load_model, resolve_model_path
 from engine.model import Qwen2ForCausalLM
 from engine.sampler import Sampler
@@ -74,7 +74,7 @@ class ModelRunner:
     to the caller.
     """
 
-    def __init__(self, model: Qwen2ForCausalLM, cache: SlotKVCache) -> None:
+    def __init__(self, model: Qwen2ForCausalLM, cache: SlotKVCache | PagedKVCache) -> None:
         self.model = model
         self.cache = cache
         self.device = cache.k.device
@@ -226,9 +226,16 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
         self.model = load_model(str(model_dir), config.torch_dtype, config.device)
         self.eos_token_ids = load_eos_token_ids(model_dir)
-        self.cache = SlotKVCache.for_model(
-            self.model.cfg, config.max_num_seqs, config.max_model_len, config.torch_dtype, config.device
-        )
+        if config.kv_cache == "paged":
+            self.cache = PagedKVCache.for_model(
+                self.model.cfg, num_blocks=config.kv_cache_tokens // config.block_size, block_size=config.block_size,
+                max_seqs=config.max_num_seqs, max_len=config.max_model_len, dtype=config.torch_dtype,
+                device=config.device,
+            )
+        else:
+            self.cache = SlotKVCache.for_model(
+                self.model.cfg, config.max_num_seqs, config.max_model_len, config.torch_dtype, config.device
+            )
         self.runner = ModelRunner(self.model, self.cache)
         self.scheduler = Scheduler(config, self.cache, self.eos_token_ids)
         self.sampler = Sampler(config.seed, config.device)
@@ -266,13 +273,12 @@ class LLMEngine:
         # Prefill the newly admitted requests, packing several prompts into
         # one forward pass where the token budget allows (or one at a time
         # if batched prefill is switched off).
+        # A request that was preempted earlier recomputes its prompt plus the
+        # tokens it had already generated (token_ids), then continues.
         budget = self.config.max_num_batched_tokens if self.config.batched_prefill else 0
-        for group in pack_by_budget([s.prompt_len for s in batch.prefills], budget):
+        for group in pack_by_budget([s.num_tokens for s in batch.prefills], budget):
             seqs = [batch.prefills[i] for i in group]
-            if len(seqs) == 1:
-                logits = self.runner.prefill(seqs[0].slot, seqs[0].prompt_token_ids).unsqueeze(0)
-            else:
-                logits = self.runner.prefill_packed([s.slot for s in seqs], [s.prompt_token_ids for s in seqs])
+            logits = self.runner.prefill_packed([s.slot for s in seqs], [s.token_ids for s in seqs])
             tokens = self.sampler(logits, [s.sampling for s in seqs])
             now = time.perf_counter()
             for seq, token in zip(seqs, tokens):

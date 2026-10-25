@@ -12,7 +12,7 @@ import torch
 from conftest import DEVICE, requires_gpu
 
 from engine.engine import ModelRunner, generate_greedy, generate_static, pack_by_budget
-from engine.kv_cache import SingleSequenceKVCache, SlotKVCache
+from engine.kv_cache import PagedKVCache, SingleSequenceKVCache, SlotKVCache
 from engine.loader import load_eos_token_ids, load_model
 from engine.model import decode_attention, sdpa_attention
 
@@ -153,3 +153,55 @@ def test_packed_prefill_logits_match_individual_prefill(model_dir, chat_prompt_i
     torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-3)
     for s, p in zip(slots, prompts):
         torch.testing.assert_close(packed.cache.k[:, s, :, : len(p)], one.cache.k[:, s, :, : len(p)], rtol=1e-4, atol=1e-4)
+
+
+def tiny_paged(num_blocks=12, block_size=4, max_seqs=4, max_len=32) -> PagedKVCache:
+    return PagedKVCache(num_layers=1, num_kv_heads=2, head_dim=8, num_blocks=num_blocks, block_size=block_size,
+                        max_seqs=max_seqs, max_len=max_len, dtype=torch.float32, device="cpu")
+
+
+def test_paged_block_bookkeeping():
+    cache = tiny_paged(num_blocks=6, block_size=4)
+    a = cache.allocate(5)  # 5 tokens -> 2 blocks
+    assert len(cache.block_tables[a]) == 2 and cache.num_free_blocks == 4
+    assert cache.ensure_capacity(a, 8) and len(cache.block_tables[a]) == 2  # still fits
+    assert cache.ensure_capacity(a, 9) and len(cache.block_tables[a]) == 3  # grows by one block
+    b = cache.allocate(12)  # 3 blocks: pool now empty
+    assert cache.num_free_blocks == 0
+    assert not cache.can_allocate(1) and not cache.ensure_capacity(b, 13)
+    cache.free(a)
+    assert cache.num_free_blocks == 3 and cache.can_allocate(12)
+    with pytest.raises(RuntimeError):
+        cache.free(a)
+
+
+@torch.inference_mode()
+def test_paged_decode_attention_matches_per_sequence():
+    """Keys spread over non-contiguous blocks must give exactly per-sequence attention."""
+    torch.manual_seed(0)
+    cache = tiny_paged(num_blocks=12, block_size=4)
+    heads, kv_heads, dim = 4, 2, 8
+    lengths = [6, 9, 3]
+    # Interleave allocations so each sequence's blocks are scattered across the pool.
+    slots = [cache.allocate(0) for _ in lengths]
+    for n_blocks in range(1, 4):
+        for s, n in zip(slots, lengths):
+            cache.ensure_capacity(s, min(n + 1, n_blocks * 4))
+    keys_by_seq = []
+    for s, n in zip(slots, lengths):
+        k = torch.randn(1, kv_heads, n, dim)
+        v = torch.randn(1, kv_heads, n, dim)
+        ctx = cache.packed_prefill_context([s], [n])
+        ctx.attend(0, torch.randn(1, heads, n, dim), k, v)
+        ctx.commit()
+        keys_by_seq.append((k, v))
+    assert cache.block_tables[slots[0]] != list(range(cache.block_tables[slots[0]][0], cache.block_tables[slots[0]][0] + 2))
+
+    q = torch.randn(3, heads, 1, dim)
+    k_new, v_new = torch.randn(3, kv_heads, 1, dim), torch.randn(3, kv_heads, 1, dim)
+    ctx = cache.decode_context(slots)
+    out = ctx.attend(0, q, k_new, v_new)
+    for b, (k, v) in enumerate(keys_by_seq):
+        full_k = torch.cat([k, k_new[b : b + 1]], dim=2)
+        full_v = torch.cat([v, v_new[b : b + 1]], dim=2)
+        torch.testing.assert_close(out[b : b + 1], sdpa_attention(q[b : b + 1], full_k, full_v), rtol=1e-5, atol=1e-6)

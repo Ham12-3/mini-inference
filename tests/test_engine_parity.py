@@ -76,6 +76,35 @@ def test_engine_matches_single_fp16(prompts):
     check_engine_matches_single(engine, prompts, max_tokens, arrive_every=7)
 
 
+def test_engine_paged_matches_single_fp32(prompts):
+    cfg = EngineConfig(device=DEVICE, dtype="float32", max_num_seqs=3, max_model_len=512, max_num_batched_tokens=1024,
+                       kv_cache="paged", block_size=16)
+    engine = LLMEngine(cfg)
+    check_engine_matches_single(engine, prompts, [8, 20, 12, 16, 6, 18, 10, 14], arrive_every=3)
+
+
+def test_engine_paged_with_preemption_matches_single(prompts):
+    """A pool of only 7 blocks forces preemption; recomputed requests must still match.
+
+    Two ~45-token prompts are admitted with 3 blocks each; growing to ~65
+    tokens they need 4 each, 8 in total, so one of them must be preempted.
+    """
+    cfg = EngineConfig(device=DEVICE, dtype="float32", max_num_seqs=4, max_model_len=112, max_num_batched_tokens=512,
+                       kv_cache="paged", block_size=16, kv_cache_tokens=112)
+    engine = LLMEngine(cfg)
+    check_engine_matches_single(engine, prompts, [20, 20, 16, 20, 12, 18, 20, 14], arrive_every=2)
+    assert engine.scheduler.num_preemptions > 0, "the test pool was meant to force preemption"
+    assert engine.cache.num_free_blocks == 7
+
+
+@requires_gpu
+def test_engine_paged_matches_single_fp16(prompts):
+    cfg = EngineConfig(device="cuda", dtype="float16", max_num_seqs=4, max_model_len=1024, max_num_batched_tokens=2048,
+                       kv_cache="paged", block_size=16)
+    engine = LLMEngine(cfg)
+    check_engine_matches_single(engine, prompts, [50, 20, 64, 35, 50, 28, 60, 40], arrive_every=7)
+
+
 def test_rejects_prompt_longer_than_max_model_len():
     cfg = EngineConfig(device=DEVICE, dtype="float32", max_num_seqs=2, max_model_len=64, max_num_batched_tokens=64)
     engine = LLMEngine(cfg)

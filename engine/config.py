@@ -37,6 +37,14 @@ class EngineConfig:
             batch every step. "static": a new batch is admitted only when the
             previous one has completely finished (the baseline continuous
             batching is compared against).
+        kv_cache: "slot" (default): one fixed max_model_len slot per sequence.
+            "paged": a pool of block_size-token blocks handed out as
+            sequences grow, so the same memory holds more sequences.
+        block_size: Tokens per block in the paged cache.
+        kv_cache_tokens: Total KV cache capacity in tokens. Defaults to
+            max_num_seqs * max_model_len (what the slot cache needs). For the
+            paged cache this sets the block pool size, so a paged engine with
+            a larger max_num_seqs can be compared at equal memory.
         batched_prefill: Pack several new prompts into one prefill forward pass
             (up to max_num_batched_tokens tokens). False prefills one prompt
             per forward pass, the simpler Stage 3/4 behaviour.
@@ -51,6 +59,9 @@ class EngineConfig:
     max_model_len: int = 2048
     max_num_batched_tokens: int = 4096
     scheduling: str = "continuous"
+    kv_cache: str = "slot"
+    block_size: int = 16
+    kv_cache_tokens: int | None = None
     batched_prefill: bool = True
     seed: int = 0
     debug: bool = False
@@ -64,6 +75,13 @@ class EngineConfig:
             raise ValueError("max_model_len must be at least 2")
         if self.scheduling not in ("continuous", "static"):
             raise ValueError(f"scheduling must be 'continuous' or 'static', got {self.scheduling!r}")
+        if self.kv_cache not in ("slot", "paged"):
+            raise ValueError(f"kv_cache must be 'slot' or 'paged', got {self.kv_cache!r}")
+        if self.kv_cache_tokens is None:
+            self.kv_cache_tokens = self.max_num_seqs * self.max_model_len
+        if self.kv_cache_tokens < self.max_model_len:
+            # Otherwise one long sequence could never fit, even alone.
+            raise ValueError("kv_cache_tokens must be >= max_model_len")
         if self.max_num_batched_tokens < self.max_model_len:
             # Otherwise a prompt of max length could never be admitted.
             raise ValueError("max_num_batched_tokens must be >= max_model_len")

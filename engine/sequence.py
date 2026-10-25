@@ -75,6 +75,7 @@ class Sequence:
     finish_reason: FinishReason | None = None
     first_token_time: float | None = None
     finish_time: float | None = None
+    num_preemptions: int = 0  # times it lost its cache space and had to recompute (paged cache)
 
     @property
     def prompt_len(self) -> int:
@@ -83,6 +84,11 @@ class Sequence:
     @property
     def num_tokens(self) -> int:
         return len(self.prompt_token_ids) + len(self.output_token_ids)
+
+    @property
+    def token_ids(self) -> list[int]:
+        """Prompt followed by everything generated so far."""
+        return self.prompt_token_ids + self.output_token_ids
 
     @property
     def last_token(self) -> int:
