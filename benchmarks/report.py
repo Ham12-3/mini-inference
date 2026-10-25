@@ -38,16 +38,30 @@ def save_results(name: str, payload: dict[str, Any]) -> Path:
     return path
 
 
-def print_saved(names: list[str]) -> None:
-    """Print saved result files on one line each between markers (to copy results off Colab)."""
+def print_saved(names: list[str], packed: bool = False) -> None:
+    """Print saved result files between markers, to copy results off Colab.
+
+    ``packed`` prints zlib-compressed base64 instead of JSON: about a third of
+    the size, which matters when copying by hand from notebook output.
+    """
+    import base64
+    import zlib
+
     for name in names:
         record = json.loads((RESULTS_DIR / f"{name}.json").read_text())
-        print(f"=== RESULT {name} BEGIN ===")
-        print(json.dumps(record, separators=(",", ":")))
-        print(f"=== RESULT {name} END ===")
+        text = json.dumps(record, separators=(",", ":"))
+        if packed:
+            print(f"=== PACKED {name} BEGIN ===")
+            print(base64.b64encode(zlib.compress(text.encode(), 9)).decode())
+            print(f"=== PACKED {name} END ===")
+        else:
+            print(f"=== RESULT {name} BEGIN ===")
+            print(text)
+            print(f"=== RESULT {name} END ===")
 
 
 if __name__ == "__main__":
     import sys
 
-    print_saved(sys.argv[1:])
+    args = sys.argv[1:]
+    print_saved([a for a in args if a != "--packed"], packed="--packed" in args)
