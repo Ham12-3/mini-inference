@@ -14,7 +14,7 @@ from conftest import DEVICE, requires_gpu
 from engine.engine import ModelRunner, generate_greedy, generate_static
 from engine.kv_cache import SingleSequenceKVCache, SlotKVCache
 from engine.loader import load_eos_token_ids, load_model
-from engine.model import sdpa_attention
+from engine.model import decode_attention, sdpa_attention
 
 
 def tiny_cache(num_slots: int = 4, max_len: int = 16) -> SlotKVCache:
@@ -35,6 +35,15 @@ def test_slot_allocation_and_reuse():
     with pytest.raises(RuntimeError):
         cache.free(0)
         cache.free(0)  # double free
+
+
+def test_decode_attention_equals_repeated_kv_attention():
+    """Regrouping query heads (no k/v copy) must give the same result as repeating k/v per head."""
+    torch.manual_seed(0)
+    q, k, v = torch.randn(3, 14, 1, 64), torch.randn(3, 2, 20, 64), torch.randn(3, 2, 20, 64)
+    mask = (torch.arange(20) <= torch.tensor([19, 7, 12]).unsqueeze(1))[:, None, None, :]
+    torch.testing.assert_close(decode_attention(q, k, v, mask), sdpa_attention(q, k, v, attn_mask=mask),
+                               rtol=1e-5, atol=1e-6)
 
 
 @torch.inference_mode()

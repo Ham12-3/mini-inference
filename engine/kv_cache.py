@@ -15,7 +15,7 @@ from collections.abc import Sequence
 
 import torch
 
-from engine.model import Qwen2Config, sdpa_attention
+from engine.model import Qwen2Config, decode_attention, sdpa_attention
 
 
 def offset_causal_mask(start: int, end: int, device: torch.device) -> torch.Tensor:
@@ -95,7 +95,7 @@ class SingleSequenceKVCache:
 
         if num_new == 1:
             # Decode: the single new token may look at every stored token (and itself).
-            return sdpa_attention(q, keys, values)
+            return decode_attention(q, keys, values)
         if start == 0:
             # Prefill of a fresh sequence: ordinary square causal mask.
             return sdpa_attention(q, keys, values, is_causal=True)
@@ -248,7 +248,7 @@ class SlotDecodeContext:
         # attention kernels avoid the copy (see Stage 6).
         keys = k_layer[self.slot_ids, :, : self.kv_len]
         values = v_layer[self.slot_ids, :, : self.kv_len]
-        return sdpa_attention(q, keys, values, attn_mask=self.mask)
+        return decode_attention(q, keys, values, attn_mask=self.mask)
 
     def commit(self) -> None:
         """Call after the forward pass: every sequence in the batch grew by one token."""

@@ -123,6 +123,30 @@ def sdpa_attention(
     return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
 
 
+def decode_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+    """Attention for exactly one new token per sequence, with GQA and no k/v copying.
+
+    :func:`sdpa_attention` repeats every kv head 7 times so each query head
+    has its own copy. In decode that copy is most of the attention work: it
+    re-reads and re-writes the whole cached history every layer, every step.
+
+    Instead, we regroup the queries. The 7 query heads that share kv head j
+    become 7 "query positions" attending to kv head j:
+
+        q: [B, heads, 1, d]  ->  [B, kv_heads, group, d]
+        k, v: [B, kv_heads, S, d]  (used as they are)
+
+    The result is the same attention, computed by one SDPA call on the
+    original k/v. ``attn_mask`` must broadcast to ``[B, 1, 1, S]`` (one mask
+    per sequence, shared by all its heads).
+    """
+    batch, heads, _, dim = q.shape
+    kv_heads = k.shape[1]
+    q = q.reshape(batch, kv_heads, heads // kv_heads, dim)  # query head h -> (h // group, h % group)
+    out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    return out.reshape(batch, heads, 1, dim)
+
+
 class RMSNorm(nn.Module):
     """Root-mean-square norm: scale each vector to unit RMS, then by a learned weight.
 
