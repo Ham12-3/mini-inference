@@ -12,7 +12,8 @@ shapes and the same memory addresses. So:
 * Inputs live in *static buffers* (token ids, positions, slot ids or block
   tables) that we overwrite before every replay.
 * Shapes must be fixed. We record one graph per (batch size, KV length)
-  *bucket* and round each real step up to the nearest bucket. Extra batch
+  *bucket* and round each real step up to the nearest bucket (batch sizes
+  1, 2, 4, 8, then every 16; KV lengths every 256 positions). Extra batch
   rows point at a scratch slot/block that no sequence owns, so their writes
   are harmless, and their outputs are ignored. Extra KV positions are hidden
   by the mask like any other padding.
@@ -30,13 +31,20 @@ from engine.kv_cache import PagedKVCache, SlotKVCache
 from engine.model import Qwen2ForCausalLM, decode_attention
 
 
-def _buckets(limit: int, start: int) -> list[int]:
-    """Powers of two from ``start`` up to ``limit``, always ending at ``limit``."""
-    sizes, size = [], start
-    while size < limit:
-        sizes.append(size)
-        size *= 2
+def _batch_buckets(limit: int) -> list[int]:
+    """1, 2, 4, 8, then every 16 up to ``limit`` (always including ``limit``).
+
+    Fine steps matter: a step with 65 sequences runs the 80-row graph, not a
+    128-row one. Padding rows are real work once a step stops being
+    dominated by launch overhead.
+    """
+    sizes = [b for b in (1, 2, 4, 8) if b < limit] + list(range(16, limit, 16))
     return sizes + [limit]
+
+
+def _kv_buckets(limit: int, step: int = 256) -> list[int]:
+    """Every ``step`` positions up to ``limit`` (always including ``limit``)."""
+    return list(range(step, limit, step)) + [limit]
 
 
 class _GraphDecodeContext:
@@ -96,8 +104,8 @@ class GraphedDecoder:
         self.model, self.cache = model, cache
         self.paged = isinstance(cache, PagedKVCache)
         self.device = cache.k.device
-        self.batch_buckets = _buckets(max_batch, 1)
-        self.kv_buckets = _buckets(cache.max_len, 256 if cache.max_len > 256 else cache.max_len)
+        self.batch_buckets = _batch_buckets(max_batch)
+        self.kv_buckets = _kv_buckets(cache.max_len)
         if self.paged:
             # kv lengths must be whole blocks
             bs = cache.block_size

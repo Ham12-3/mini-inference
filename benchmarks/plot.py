@@ -33,6 +33,8 @@ BACKEND_STYLE = {
     "vllm": ("#eda100", "vLLM"),
     "engine_static": ("#e87ba4", "My engine, static batching"),
     "engine_paged": ("#008300", "My engine, paged KV cache"),
+    "engine_graphs": ("#6250d6", "My engine + CUDA graphs"),
+    "engine_paged_prefix": ("#e34948", "Paged + prefix caching"),
 }
 
 # Stage 5 result files: backend style key -> run_bench backend name.
@@ -338,6 +340,72 @@ def plot_paged_vs_slot() -> Path | None:
     return path
 
 
+def plot_prefix_caching() -> Path | None:
+    """Chart 7: time to first token with a shared 512-token system prompt, with and without prefix caching."""
+    runs = {
+        (key, rate): _load(f"bench_{key}_rate{rate}_seqs128_prefix512")
+        for key in ("engine_paged", "engine_paged_prefix") for rate in ("inf", "4")
+    }
+    if any(r is None for r in runs.values()):
+        return None
+    env = runs[("engine_paged", "inf")]["env"]
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4.8), dpi=150)
+    fig.patch.set_facecolor(SURFACE)
+    fig.subplots_adjust(top=0.78, left=0.08, right=0.97, bottom=0.12, wspace=0.3)
+    fig.suptitle("Prefix caching: a shared system prompt is computed once", x=0.03, y=0.97, ha="left",
+                 fontsize=13, fontweight="bold", color=TEXT)
+    fig.text(0.03, 0.9, _setup_line(env, "200 requests · shared 512-token prefix + 32-128 own tokens · "
+                                          "paged cache, up to 128 sequences"), ha="left", fontsize=8.5, color=TEXT_MUTED)
+    for ax, rate, title in ((axes[0], "inf", "All 200 requests at once"), (axes[1], "4", "Poisson arrivals, 4 req/s")):
+        labels, values, colors = [], [], []
+        for key, name in (("engine_paged", "Paged"), ("engine_paged_prefix", "Paged + prefix cache")):
+            m = runs[(key, rate)]["metrics"]
+            for stat in ("ttft_p50_s", "ttft_p95_s"):
+                labels.append(f"{name}\n{'p50' if stat.endswith('p50_s') else 'p95'}".replace("\n", NL))
+                values.append(m[stat])
+                colors.append(BACKEND_STYLE[key][0])
+        xs = range(len(values))
+        ax.bar(xs, values, color=colors, width=0.6)
+        _style_axes(ax)
+        ax.set_xticks(list(xs), labels, fontsize=8, color=TEXT)
+        ax.set_title(title, loc="left", fontsize=10, color=TEXT)
+        ax.set_ylabel("time to first token (s)", color=TEXT_MUTED, fontsize=9)
+        top = max(values)
+        ax.set_ylim(0, top * 1.2)
+        for x, v in zip(xs, values):
+            ax.text(x, v + top * 0.02, f"{v:.2f} s" if v < 1 else f"{v:.1f} s", ha="center", fontsize=8.5, color=TEXT)
+    path = RESULTS_DIR / "chart7_prefix_caching.png"
+    fig.savefig(path, facecolor=SURFACE)
+    plt.close(fig)
+    print(f"wrote {path}")
+    return path
+
+
+def plot_cuda_graphs() -> Path | None:
+    """Chart 8: static-batch throughput vs batch size, eager decode vs CUDA-graph decode."""
+    data = {}
+    env = None
+    for key, name in (("hf", "static_hf"), ("engine", "static_engine"), ("engine_graphs", "static_engine_graphs")):
+        res = _load(name)
+        if res:
+            env = env or res["env"]
+            data[key] = [(r["batch_size"], r["tokens_per_s"]) for r in res["runs"]]
+    if "engine_graphs" not in data or env is None:
+        return None
+    fig, ax = _new_figure(
+        "CUDA graphs: removing launch overhead from every decode step",
+        _setup_line(env, "Qwen2.5-0.5B-Instruct · fp16 · 128 new tokens per request · static batches"),
+    )
+    all_x = sorted({x for pts in data.values() for x, _ in pts})
+    ax.set_xticks(all_x, [str(x) for x in all_x])
+    ax.set_xlabel("Batch size (requests decoded together)", color=TEXT_MUTED, fontsize=10)
+    ax.set_ylabel("Output throughput (tokens/s)", color=TEXT_MUTED, fontsize=10)
+    ax.set_ylim(0, max(y for pts in data.values() for _, y in pts) * 1.12)
+    _plot_lines(ax, data, labels={"engine": "My engine (eager)", "engine_graphs": "My engine + CUDA graphs"})
+    ax.legend(loc="upper left", frameon=False, fontsize=9, labelcolor=TEXT)
+    return _save(fig, "chart8_cuda_graphs.png")
+
+
 def main() -> None:
     plot_single_request()
     plot_static_batching()
@@ -345,6 +413,8 @@ def main() -> None:
     plot_batch_timeline()
     plot_latency_vs_load()
     plot_paged_vs_slot()
+    plot_prefix_caching()
+    plot_cuda_graphs()
 
 
 if __name__ == "__main__":
