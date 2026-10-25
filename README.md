@@ -15,7 +15,7 @@ batching, all running on a single Colab T4 GPU.
 | 0 | Repo skeleton, Colab notebook, GPU + model check | done |
 | 1 | Naive baseline (no cache) | done |
 | 2 | Own Qwen2 model + single-sequence KV cache | done |
-| 3 | Slot-based KV cache + static batching | |
+| 3 | Slot-based KV cache + static batching | done |
 | 4 | Scheduler + continuous batching | |
 | 5 | Benchmarks vs baselines and vLLM | |
 | 6 | Extras: streaming API, paged KV cache | |
@@ -37,6 +37,26 @@ and within 1e-3 on the GPU. In float16, greedy output matches HF `generate()`
 for 50 tokens on 4 of 5 prompts; the fifth matches for 40 tokens and then
 hits an exact fp16 tie between the top two tokens (see
 `tests/test_model_parity.py` for how ties are verified).
+
+### Static batching (Stage 3)
+
+![Throughput vs batch size](benchmarks/results/chart2_static_batching.png)
+
+Each request generates 128 tokens; all requests in a batch start together.
+
+| Batch size | My engine | HF `generate()` |
+|---:|---:|---:|
+| 1 | 40 tok/s | 34 tok/s |
+| 8 | 291 tok/s | 281 tok/s |
+| 32 | 987 tok/s | 1,076 tok/s |
+
+Going from 1 to 32 requests per batch makes each batch only 28% slower
+(3.24 s to 4.15 s), so throughput grows 25x: a decode step reads the weights
+once whether it serves one sequence or 32. Batched greedy outputs are
+identical to running each prompt alone (fp32 and fp16, `tests/test_kv_cache.py`).
+At batch 32 HF is about 9% faster: my decode step copies each sequence's
+keys/values out of its cache slot and repeats them for every query head, and
+that work grows with the batch.
 
 ## Run it
 
