@@ -22,13 +22,32 @@ SURFACE = "#fcfcfb"
 TEXT = "#0b0b0b"
 TEXT_MUTED = "#52514e"
 GRID = "#e4e3df"
+NL = chr(10)  # line break inside labels
 
-# Fixed colour and label per backend (validated categorical palette, slots 1-4).
+# Fixed colour and label per backend (validated categorical palette, slots 1-5).
+# "engine" is my engine with continuous batching wherever batching applies.
 BACKEND_STYLE = {
     "engine": ("#2a78d6", "My engine"),
     "naive": ("#eb6834", "Naive (no KV cache)"),
     "hf": ("#1baf7a", "HF generate()"),
     "vllm": ("#eda100", "vLLM"),
+    "engine_static": ("#e87ba4", "My engine, static batching"),
+}
+
+# Stage 5 result files: backend style key -> run_bench backend name.
+BENCH_BACKENDS = [
+    ("naive", "naive"),
+    ("hf", "hf_static"),
+    ("engine_static", "engine_static"),
+    ("engine", "engine_continuous"),
+    ("vllm", "vllm"),
+]
+BENCH_LABELS = {
+    "naive": "Naive, no cache" + NL + "(10-request subset)",
+    "hf": "HF generate()," + NL + "static batches",
+    "engine_static": "My engine," + NL + "static batching",
+    "engine": "My engine," + NL + "continuous batching",
+    "vllm": "vLLM",
 }
 
 
@@ -166,9 +185,110 @@ def plot_static_batching() -> Path | None:
     return _save(fig, "chart2_static_batching.png")
 
 
+def _bench(backend: str, rate: str) -> dict | None:
+    return _load(f"bench_{backend}_rate{rate}")
+
+
+def plot_serving_comparison() -> Path | None:
+    """Chart 3: offline throughput and p95 end-to-end latency, every backend, same 200 requests."""
+    rows = [(key, _bench(name, "inf")) for key, name in BENCH_BACKENDS]
+    rows = [(key, res) for key, res in rows if res]
+    if not rows:
+        return None
+    env = next(res["env"] for _, res in rows if "env" in res)
+
+    fig, (ax_tp, ax_lat) = plt.subplots(1, 2, figsize=(10, 4.8), dpi=150)
+    fig.patch.set_facecolor(SURFACE)
+    fig.subplots_adjust(top=0.8, left=0.2, right=0.97, bottom=0.12, wspace=0.55)
+    fig.suptitle("Serving 200 mixed requests: continuous batching wins", x=0.03, y=0.97, ha="left",
+                 fontsize=13, fontweight="bold", color=TEXT)
+    fig.text(0.03, 0.9, _setup_line(env, "Qwen2.5-0.5B-Instruct · fp16 · all requests arrive at t=0 · "
+                                         "prompts 32-512, outputs 16-512 tokens · 32 slots"),
+             ha="left", fontsize=8.5, color=TEXT_MUTED)
+
+    def bars(ax, values, title, unit, fmt):
+        keys = [k for k, _ in values]
+        ys = list(range(len(values)))[::-1]
+        ax.barh(ys, [v for _, v in values], color=[BACKEND_STYLE[k][0] for k in keys], height=0.6)
+        ax.set_yticks(ys, [BENCH_LABELS[k] for k in keys], fontsize=8.5, color=TEXT)
+        ax.set_title(title, loc="left", fontsize=10, color=TEXT)
+        ax.set_xlabel(unit, color=TEXT_MUTED, fontsize=9)
+        _style_axes(ax)
+        ax.grid(axis="y", visible=False)
+        ax.grid(axis="x", color=GRID, linewidth=0.8)
+        top = max(v for _, v in values)
+        ax.set_xlim(0, top * 1.25)
+        for y, (_, v) in zip(ys, values):
+            ax.text(v + top * 0.02, y, fmt(v), va="center", fontsize=8.5, color=TEXT)
+
+    bars(ax_tp, [(k, r["metrics"]["output_tokens_per_s"]) for k, r in rows],
+         "Output throughput (higher is better)", "tokens / second", lambda v: f"{v:,.0f}")
+    lat = [(k, r["metrics"]["e2e_p95_s"]) for k, r in rows if k != "naive" and "e2e_p95_s" in r["metrics"]]
+    bars(ax_lat, lat, "p95 end-to-end latency (lower is better)", "seconds", lambda v: f"{v:.1f} s")
+    path = RESULTS_DIR / "chart3_serving_comparison.png"
+    fig.savefig(path, facecolor=SURFACE)
+    plt.close(fig)
+    print(f"wrote {path}")
+    return path
+
+
+def plot_batch_timeline() -> Path | None:
+    """Chart 4: how many requests are in the running batch over time, continuous vs static."""
+    runs = [(key, _bench(name, "inf")) for key, name in (("engine_static", "engine_static"), ("engine", "engine_continuous"))]
+    runs = [(k, r) for k, r in runs if r and r.get("timeline")]
+    if not runs:
+        return None
+    fig, ax = _new_figure(
+        "Batch size over time: continuous batching keeps the GPU full",
+        _setup_line(runs[0][1]["env"], "same 200 requests, all queued at t=0 · 32 slots"),
+    )
+    ends = []
+    for key, res in runs:
+        t, running = zip(*[(p[0], p[1]) for p in res["timeline"]])
+        color, _ = BACKEND_STYLE[key]
+        label = "Continuous batching" if key == "engine" else "Static batching"
+        ax.step(t, running, where="post", color=color, linewidth=1.6, label=label)
+        ends.append((t[-1], label, res["metrics"]["duration_s"]))
+    ax.set_xlabel("Time since start (seconds)", color=TEXT_MUTED, fontsize=10)
+    ax.set_ylabel("Requests in the running batch", color=TEXT_MUTED, fontsize=10)
+    ax.set_ylim(0, 36)
+    for x, label, duration in ends:
+        ax.annotate(f"{label}" + NL + f"done at {duration:.0f} s", (x, 0), xytext=(4, 30), textcoords="offset points",
+                    fontsize=8.5, color=TEXT, annotation_clip=False)
+    ax.legend(loc="upper right", frameon=False, fontsize=9, labelcolor=TEXT, bbox_to_anchor=(1.3, 1.0))
+    return _save(fig, "chart4_batch_timeline.png")
+
+
+def plot_latency_vs_load() -> Path | None:
+    """Chart 5: p95 time to first token as the request rate grows, static vs continuous."""
+    rates = ["2", "4", "inf"]
+    data = {}
+    env = None
+    for key, name in (("engine_static", "engine_static"), ("engine", "engine_continuous"), ("hf", "hf_static")):
+        pts = [(i, r["metrics"]["ttft_p95_s"]) for i, rate in enumerate(rates) if (r := _bench(name, rate))]
+        if pts:
+            data[key] = pts
+            env = env or _bench(name, "inf") or _bench(name, "2")
+    if not data or env is None:
+        return None
+    fig, ax = _new_figure(
+        "Time to first token under load",
+        _setup_line(env["env"], "200 requests, Poisson arrivals · p95 TTFT (includes queueing)"),
+    )
+    _plot_lines(ax, data)
+    ax.set_xticks(range(len(rates)), ["2 req/s", "4 req/s", "all at once"])
+    ax.set_xlabel("Request arrival rate", color=TEXT_MUTED, fontsize=10)
+    ax.set_ylabel("p95 time to first token (seconds)", color=TEXT_MUTED, fontsize=10)
+    ax.legend(loc="upper left", frameon=False, fontsize=9, labelcolor=TEXT)
+    return _save(fig, "chart5_latency_vs_load.png")
+
+
 def main() -> None:
     plot_single_request()
     plot_static_batching()
+    plot_serving_comparison()
+    plot_batch_timeline()
+    plot_latency_vs_load()
 
 
 if __name__ == "__main__":
