@@ -84,7 +84,7 @@ is wasted and many more sequences fit in the same GPU.
 ## Architecture
 
 ```mermaid
-flowchart LR
+flowchart TD
     A["add_request(prompt, sampling params)"] --> Q["Waiting queue<br/>(FIFO)"]
     Q --> S{"Scheduler<br/>every step"}
     S -->|"admit while: free slot,<br/>max_num_seqs, token budget"| P["Packed prefill<br/>(new requests, one forward pass)"]
