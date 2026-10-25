@@ -32,6 +32,7 @@ BACKEND_STYLE = {
     "hf": ("#1baf7a", "HF generate()"),
     "vllm": ("#eda100", "vLLM"),
     "engine_static": ("#e87ba4", "My engine, static batching"),
+    "engine_paged": ("#008300", "My engine, paged KV cache"),
 }
 
 # Stage 5 result files: backend style key -> run_bench backend name.
@@ -292,12 +293,58 @@ def plot_latency_vs_load() -> Path | None:
     return _save(fig, "chart5_latency_vs_load.png")
 
 
+def plot_paged_vs_slot() -> Path | None:
+    """Chart 6: sequences running at once and throughput, slot cache vs paged cache, same KV memory."""
+    slot = _bench("engine_continuous", "inf")
+    paged = _load("bench_engine_paged_rateinf_seqs128")
+    if not (slot and paged and slot.get("timeline") and paged.get("timeline")):
+        return None
+    color_slot, color_paged = BACKEND_STYLE["engine"][0], BACKEND_STYLE["engine_paged"][0]
+    gb = paged["kv_cache_tokens"] * 12 * 1024 / 1e9 if paged.get("kv_cache_tokens") else None
+
+    fig, (ax_t, ax_b) = plt.subplots(1, 2, figsize=(10, 4.8), dpi=150, gridspec_kw={"width_ratios": [2.2, 1]})
+    fig.patch.set_facecolor(SURFACE)
+    fig.subplots_adjust(top=0.8, left=0.07, right=0.97, bottom=0.12, wspace=0.35)
+    fig.suptitle("Paged KV cache: more sequences in the same memory", x=0.03, y=0.97, ha="left",
+                 fontsize=13, fontweight="bold", color=TEXT)
+    memory = f"{gb:.2f} GB KV cache for both" if gb else "same KV memory"
+    fig.text(0.03, 0.9, _setup_line(paged["env"], f"same 200 requests at t=0 · {memory} · 16-token blocks"),
+             ha="left", fontsize=8.5, color=TEXT_MUTED)
+
+    for res, color, label in ((slot, color_slot, "Slot cache (32 slots)"),
+                              (paged, color_paged, f"Paged cache (up to {paged['max_num_seqs']} sequences)")):
+        t, running = zip(*[(p[0], p[1]) for p in res["timeline"]])
+        ax_t.step(t, running, where="post", color=color, linewidth=1.6, label=label)
+    _style_axes(ax_t)
+    ax_t.set_xlabel("Time since start (seconds)", color=TEXT_MUTED, fontsize=10)
+    ax_t.set_ylabel("Sequences running at once", color=TEXT_MUTED, fontsize=10)
+    ax_t.set_ylim(bottom=0)
+    ax_t.legend(loc="upper right", frameon=False, fontsize=9, labelcolor=TEXT)
+
+    rows = [("Slot", slot["metrics"]["output_tokens_per_s"], color_slot),
+            ("Paged", paged["metrics"]["output_tokens_per_s"], color_paged)]
+    ax_b.bar([r[0] for r in rows], [r[1] for r in rows], color=[r[2] for r in rows], width=0.6)
+    _style_axes(ax_b)
+    ax_b.set_title("Output throughput", loc="left", fontsize=10, color=TEXT)
+    ax_b.set_ylabel("tokens / second", color=TEXT_MUTED, fontsize=9)
+    top = max(r[1] for r in rows)
+    ax_b.set_ylim(0, top * 1.2)
+    for i, (_, v, _) in enumerate(rows):
+        ax_b.text(i, v + top * 0.02, f"{v:,.0f}", ha="center", fontsize=9, color=TEXT)
+    path = RESULTS_DIR / "chart6_paged_vs_slot.png"
+    fig.savefig(path, facecolor=SURFACE)
+    plt.close(fig)
+    print(f"wrote {path}")
+    return path
+
+
 def main() -> None:
     plot_single_request()
     plot_static_batching()
     plot_serving_comparison()
     plot_batch_timeline()
     plot_latency_vs_load()
+    plot_paged_vs_slot()
 
 
 if __name__ == "__main__":
