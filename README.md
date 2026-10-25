@@ -16,6 +16,11 @@ the 95th-percentile time to first token is **0.06 s with continuous batching
 versus 30.7 s with static batching**. Real vLLM is still 2.4x faster than my
 engine (2,002 tokens/s); [why](#honest-limitations) is explained below.
 
+With the **paged KV cache** (Stage 6), the same KV memory runs up to 119
+sequences at once instead of 32, and throughput rises to **1,357 tokens/s**
+(1.6x the slot cache). A FastAPI server streams tokens to clients with
+Server-Sent Events.
+
 ![Serving comparison](benchmarks/results/chart3_serving_comparison.png)
 
 ## Contents
@@ -24,6 +29,7 @@ engine (2,002 tokens/s); [why](#honest-limitations) is explained below.
 2. [Architecture](#architecture)
 3. [Design decisions and trade-offs](#design-decisions-and-trade-offs)
 4. [Results](#results)
+   (plus [Stage 6: streaming server and paged KV cache](#stage-6-streaming-server-and-paged-kv-cache))
 5. [Things that surprised me](#things-that-surprised-me)
 6. [Honest limitations](#honest-limitations)
 7. [How to run it](#how-to-run-it)
@@ -279,6 +285,71 @@ step    64 | decode batch  21 | +11 joined | -0 finished  | running  32 | waitin
 (This demo ran before packed prefill was added, and a third of its requests
 use sampling, so its throughput is not comparable with section 3.)
 
+## Stage 6: streaming server and paged KV cache
+
+### Streaming API
+
+[`api/server.py`](api/server.py) serves `POST /generate` and streams tokens
+back as Server-Sent Events (one `data: {...}` message per token, then a final
+message with the finish reason and token counts). One background thread owns
+the engine and loops `engine.step()`; HTTP handlers only put requests into a
+thread-safe inbox and read tokens from their own asyncio queue, so the engine
+needs no locks and the GPU work never blocks the web server. If a client
+disconnects, its request is aborted and its cache space freed at once.
+
+```bash
+uvicorn api.server:app --port 8000
+curl -N localhost:8000/generate -H 'Content-Type: application/json'      -d '{"prompt": "Write one sentence about GPUs.", "max_tokens": 24}'
+# data: {"token": 20656, "text": "Graphics"}
+# data: {"token": 28125, "text": " Processing"}
+# ...
+```
+
+Load test ([`api/load_test.py`](api/load_test.py)): N clients at once, each
+streaming one request of 32 to 256 tokens, through the real HTTP server on the
+T4 (32 slots):
+
+| Concurrent clients | Output tok/s | TTFT p50 / p95 | Request latency p50 / p95 |
+|---:|---:|---:|---:|
+| 1 | 38 | 0.03 / 0.03 s | 6.8 / 6.8 s |
+| 8 | 168 | 0.15 / 0.15 s | 3.6 / 7.0 s |
+| 32 | 510 | 0.18 / 0.19 s | 2.1 / 7.7 s |
+| 64 | 645 | 0.73 / 4.30 s | 4.3 / 9.1 s |
+
+Up to 32 clients every request starts within 0.2 s. At 64, half of them wait
+for a slot, which shows up in the p95 TTFT.
+
+### Paged KV cache
+
+[`PagedKVCache`](engine/kv_cache.py) splits the same KV memory into 16-token
+blocks. Each sequence has a block table; token p lives in block
+`table[p // 16]` at offset `p % 16`, and blocks are handed out as the
+sequence grows. Batched decode gathers each sequence's blocks through its
+table, and packed prefill scatters tokens to (block, offset) instead of
+(slot, position), so the model and the attention maths are unchanged. When
+the block pool runs out, the scheduler **preempts** the most recently admitted
+request: its blocks are freed and it goes back to the front of the queue; when
+readmitted it recomputes its KV with one prefill over its prompt plus the
+tokens it had already generated, then continues. A test with a pool of only 7
+blocks forces preemption and checks every output still matches running the
+request alone.
+
+![Paged vs slot cache](benchmarks/results/chart6_paged_vs_slot.png)
+
+Same 200-request offline workload, same 0.40 GB of KV memory (32 x 1,024
+tokens):
+
+| KV cache | Max sequences at once | Output tok/s | TTFT p50 / p95 | TPOT p50 | End-to-end p50 / p95 | Preemptions |
+|---|---:|---:|---:|---:|---:|---:|
+| Slot (32 slots of 1,024 tokens) | 32 | 826 | 13.3 / 26.3 s | 31 ms | 18.4 / 33.7 s | 0 |
+| **Paged (16-token blocks, up to 128 sequences)** | **119** | **1,357** | 2.7 / 9.3 s | 46 ms | 9.6 / 20.2 s | 45 |
+
+A slot reserves 1,024 tokens whether a request needs 50 or 1,000. With
+blocks, a request holds only what it uses, so 3.7x as many fit and the batch
+is much bigger. Each step serves more sequences, so time per token goes up,
+but every request finishes sooner. 45 preemptions show the pool really ran
+full; recomputation is cheap here because prompts are short.
+
 ## Things that surprised me
 
 * **Hugging Face `generate()` was not doing greedy decoding.** My first fp16
@@ -315,7 +386,8 @@ use sampling, so its throughput is not comparable with section 3.)
 
 ## Honest limitations
 
-* **vLLM is 2.4x faster.** The main reason is per-step overhead. A decode step
+* **vLLM is 2.4x faster** than my slot-cache engine (1.5x faster than the
+  paged one). The main reason is per-step overhead. A decode step
   in my engine costs about 25 to 30 ms whether it serves 1 or 32 sequences,
   while the actual GPU work (reading 1 GB of weights) is about 3 ms. The rest
   is Python and hundreds of small kernel launches per step. vLLM captures the

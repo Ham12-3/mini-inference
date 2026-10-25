@@ -1,0 +1,58 @@
+{
+  "name": "api_load_test",
+  "created_utc": "2026-10-25T11:42:47+00:00",
+  "env": {
+    "python": "3.13.16",
+    "platform": "Linux-6.6.122+-x86_64-with-glibc2.39",
+    "torch": "2.11.0+cu130",
+    "torch_cuda": "13.0",
+    "transformers": "5.20.2",
+    "cuda_available": true,
+    "gpu": "Tesla T4",
+    "gpu_capability": "7.5",
+    "gpu_memory_gb": 15.64
+  },
+  "url_is_local": true,
+  "runs": [
+    {
+      "concurrency": 1,
+      "output_tokens": 256,
+      "wall_s": 6.821,
+      "output_tokens_per_s": 37.5,
+      "ttft_p50_s": 0.029,
+      "ttft_p95_s": 0.029,
+      "latency_p50_s": 6.821,
+      "latency_p95_s": 6.821
+    },
+    {
+      "concurrency": 8,
+      "output_tokens": 1184,
+      "wall_s": 7.03,
+      "output_tokens_per_s": 168.4,
+      "ttft_p50_s": 0.145,
+      "ttft_p95_s": 0.146,
+      "latency_p50_s": 3.636,
+      "latency_p95_s": 7.029
+    },
+    {
+      "concurrency": 32,
+      "output_tokens": 3904,
+      "wall_s": 7.661,
+      "output_tokens_per_s": 509.6,
+      "ttft_p50_s": 0.184,
+      "ttft_p95_s": 0.185,
+      "latency_p50_s": 2.149,
+      "latency_p95_s": 7.657
+    },
+    {
+      "concurrency": 64,
+      "output_tokens": 6944,
+      "wall_s": 10.759,
+      "output_tokens_per_s": 645.4,
+      "ttft_p50_s": 0.727,
+      "ttft_p95_s": 4.298,
+      "latency_p50_s": 4.251,
+      "latency_p95_s": 9.074
+    }
+  ]
+}
