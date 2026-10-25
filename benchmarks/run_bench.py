@@ -9,6 +9,7 @@ Backends:
     hf_static          HF generate(), static batches of up to --max-num-seqs requests
     engine_static      my engine, a new batch only when the previous one is done
     engine_continuous  my engine, continuous batching
+    engine_paged       my engine, continuous batching with the paged KV cache (same memory)
 
 Every backend serves the same requests (same prompts, same output lengths,
 EOS ignored) in the same way: a request can only start after its arrival
@@ -62,13 +63,19 @@ def wait_until(t: float) -> None:
 # an optional timeline of (seconds since start, running batch size, queue length).
 
 
-def run_engine(requests: list[Request], start: float, scheduling: str, max_num_seqs: int):
+# KV cache memory for every engine run, in tokens: what 32 slots of
+# MAX_MODEL_LEN need. The paged run gets exactly the same memory.
+KV_CACHE_TOKENS = 32 * MAX_MODEL_LEN
+
+
+def run_engine(requests: list[Request], start: float, scheduling: str, max_num_seqs: int, kv_cache: str = "slot"):
     from engine.config import EngineConfig
     from engine.engine import LLMEngine
     from engine.sequence import SamplingParams
 
     engine = LLMEngine(EngineConfig(model=MODEL, max_num_seqs=max_num_seqs, max_model_len=MAX_MODEL_LEN,
-                                    max_num_batched_tokens=4096, scheduling=scheduling))
+                                    max_num_batched_tokens=4096, scheduling=scheduling, kv_cache=kv_cache,
+                                    kv_cache_tokens=KV_CACHE_TOKENS))
     # Warm-up (kernel selection, allocator), then forget it.
     engine.generate([r.prompt_ids for r in requests[:4]], SamplingParams(max_tokens=8, ignore_eos=True))
     engine.step_stats.clear()
@@ -94,6 +101,7 @@ def run_engine(requests: list[Request], start: float, scheduling: str, max_num_s
         s = engine.sequences[rid]
         records.append(Record(s.arrival_time, s.first_token_time, s.finish_time, len(s.output_token_ids)))
     timeline = [(st.time - start, st.num_running, st.num_waiting) for st in engine.step_stats]
+    run_engine.num_preemptions = engine.scheduler.num_preemptions  # reported by main()
     return start, records, timeline
 
 
@@ -174,6 +182,9 @@ BACKENDS = {
     "hf_static": run_hf_static,
     "engine_static": lambda reqs, start, n: run_engine(reqs, start, "static", n),
     "engine_continuous": lambda reqs, start, n: run_engine(reqs, start, "continuous", n),
+    # Same KV memory as the slot cache, handed out in 16-token blocks; use a
+    # larger --max-num-seqs to let more sequences run at once.
+    "engine_paged": lambda reqs, start, n: run_engine(reqs, start, "continuous", n, kv_cache="paged"),
 }
 
 
@@ -229,10 +240,14 @@ def main() -> None:
 
     start, records, timeline = BACKENDS[args.backend](requests, time.perf_counter(), args.max_num_seqs)
     metrics = summarize(records, start)
+    if timeline:
+        metrics["max_concurrent_seqs"] = max(running for _, running, _ in timeline)
+    if args.backend.startswith("engine"):
+        metrics["preemptions"] = run_engine.num_preemptions
     print(" ".join(f"{k}={v}" for k, v in metrics.items()))
 
     save_results(
-        f"bench_{args.backend}_rate{args.rate}",
+        f"bench_{args.backend}_rate{args.rate}" + (f"_seqs{args.max_num_seqs}" if args.max_num_seqs != 32 else ""),
         {
             "backend": args.backend,
             "model": MODEL,
@@ -241,6 +256,7 @@ def main() -> None:
                          "prompt_len": [32, 512], "output_len": "70% in [16,128], 30% in [256,512]",
                          "ignore_eos": True},
             "max_num_seqs": args.max_num_seqs,
+            "kv_cache_tokens": KV_CACHE_TOKENS if args.backend.startswith("engine") else None,
             "metrics": metrics,
             "timeline": downsample(timeline),
         },
