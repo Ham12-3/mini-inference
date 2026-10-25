@@ -16,7 +16,7 @@ batching, all running on a single Colab T4 GPU.
 | 1 | Naive baseline (no cache) | done |
 | 2 | Own Qwen2 model + single-sequence KV cache | done |
 | 3 | Slot-based KV cache + static batching | done |
-| 4 | Scheduler + continuous batching | |
+| 4 | Scheduler + continuous batching | done |
 | 5 | Benchmarks vs baselines and vLLM | |
 | 6 | Extras: streaming API, paged KV cache | |
 
@@ -57,6 +57,29 @@ identical to running each prompt alone (fp32 and fp16, `tests/test_kv_cache.py`)
 At batch 32 HF is about 9% faster: my decode step copies each sequence's
 keys/values out of its cache slot and repeats them for every query head, and
 that work grows with the batch.
+
+### Continuous batching (Stage 4)
+
+`LLMEngine.step()` makes one scheduler decision, prefills newly admitted
+requests, then runs one batched decode for everything already running.
+Finished requests free their cache slot inside the step; waiting requests
+take it at the start of the next. From the 100-request demo
+(`scripts/demo_continuous_batching.py --debug`, 32 slots, output caps 16 to
+256 tokens):
+
+```
+step     0 | decode batch   0 | +32 joined | -0 finished  | running  32 | waiting   68
+step    15 | decode batch  32 | +0 joined  | -5 finished  | running  27 | waiting   68
+step    16 | decode batch  27 | +5 joined  | -0 finished  | running  32 | waiting   63
+step    63 | decode batch  32 | +0 joined  | -11 finished | running  21 | waiting   57
+step    64 | decode batch  21 | +11 joined | -0 finished  | running  32 | waiting   46
+...
+100 requests, 10155 output tokens in 17.9s = 566 tok/s over 491 steps
+```
+
+With greedy sampling every request's output is identical to running it
+alone, even though it joined, shared and left batches of changing size
+(`tests/test_engine_parity.py`, fp32 and fp16).
 
 ## Run it
 
