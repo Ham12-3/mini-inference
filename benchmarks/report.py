@@ -36,3 +36,18 @@ def save_results(name: str, payload: dict[str, Any]) -> Path:
     print(f"=== RESULT {name} END ===")
     print(f"saved {path}")
     return path
+
+
+def print_saved(names: list[str]) -> None:
+    """Print saved result files on one line each between markers (to copy results off Colab)."""
+    for name in names:
+        record = json.loads((RESULTS_DIR / f"{name}.json").read_text())
+        print(f"=== RESULT {name} BEGIN ===")
+        print(json.dumps(record, separators=(",", ":")))
+        print(f"=== RESULT {name} END ===")
+
+
+if __name__ == "__main__":
+    import sys
+
+    print_saved(sys.argv[1:])
