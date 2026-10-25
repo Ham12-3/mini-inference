@@ -6,26 +6,33 @@
 * :func:`generate_static`: static batching (Stage 3). All requests start
   together and the batch runs until the last one finishes.
 
-The multi-request ``LLMEngine`` (scheduler + continuous batching) arrives in Stage 4.
+* :class:`LLMEngine`: request queue + scheduler + continuous batching (Stage 4).
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import time
+from collections.abc import Sequence as SequenceOf
+from dataclasses import dataclass
 
 import torch
 
+from engine.config import EngineConfig
 from engine.kv_cache import SingleSequenceKVCache, SlotKVCache
+from engine.loader import load_eos_token_ids, load_model, resolve_model_path
 from engine.model import Qwen2ForCausalLM
+from engine.sampler import Sampler
+from engine.scheduler import Scheduler
+from engine.sequence import SamplingParams, Sequence
 
 
 @torch.inference_mode()
 def generate_greedy(
     model: Qwen2ForCausalLM,
-    prompt_ids: Sequence[int],
+    prompt_ids: SequenceOf[int],
     max_new_tokens: int,
     cache: SingleSequenceKVCache,
-    eos_token_ids: Sequence[int] = (),
+    eos_token_ids: SequenceOf[int] = (),
 ) -> list[int]:
     """Greedy-decode one sequence using a KV cache.
 
@@ -73,7 +80,7 @@ class ModelRunner:
         self.device = cache.k.device
 
     @torch.inference_mode()
-    def prefill(self, slot: int, prompt_ids: Sequence[int]) -> torch.Tensor:
+    def prefill(self, slot: int, prompt_ids: SequenceOf[int]) -> torch.Tensor:
         """Process a whole prompt into ``slot``; return the logits for the next token, ``[vocab]``."""
         ctx = self.cache.prefill_context(slot)
         ids = torch.tensor([list(prompt_ids)], device=self.device)
@@ -83,7 +90,7 @@ class ModelRunner:
         return self.model.compute_logits(hidden[0, -1]).float()
 
     @torch.inference_mode()
-    def decode(self, slots: Sequence[int], last_tokens: Sequence[int]) -> torch.Tensor:
+    def decode(self, slots: SequenceOf[int], last_tokens: SequenceOf[int]) -> torch.Tensor:
         """One decode step for many sequences in ONE forward pass; returns logits ``[B, vocab]``.
 
         ``last_tokens[b]`` is the most recent token of the sequence in
@@ -98,9 +105,9 @@ class ModelRunner:
 
 def generate_static(
     runner: ModelRunner,
-    prompts: Sequence[Sequence[int]],
+    prompts: SequenceOf[SequenceOf[int]],
     max_new_tokens: int,
-    eos_token_ids: Sequence[int] = (),
+    eos_token_ids: SequenceOf[int] = (),
 ) -> list[list[int]]:
     """Greedy static batching: prefill every prompt, then decode them together until all are done.
 
@@ -135,3 +142,143 @@ def generate_static(
         for slot in slots:
             cache.free(slot)
     return outputs
+
+
+@dataclass
+class RequestOutput:
+    """A finished (or in-progress) request as returned to the caller."""
+
+    request_id: int
+    prompt_token_ids: list[int]
+    output_token_ids: list[int]
+    text: str | None
+    finish_reason: str | None
+    arrival_time: float
+    first_token_time: float | None
+    finish_time: float | None
+
+
+@dataclass
+class StepStats:
+    """What happened in one engine step (used for the debug log and the batch-size timeline)."""
+
+    step: int
+    time: float  # perf_counter at the end of the step
+    num_prefills: int
+    num_decodes: int
+    num_finished: int
+    num_running: int  # after the step
+    num_waiting: int  # after the step
+
+
+class LLMEngine:
+    """Serves many requests at once with continuous batching.
+
+    Every call to :meth:`step` does one scheduler decision, prefills the newly
+    admitted requests (one at a time), then runs ONE batched decode for
+    everything already running. Requests finish and free their slot inside a
+    step, and new ones are admitted at the start of the next: the batch
+    changes shape every step instead of waiting for its slowest member.
+    """
+
+    def __init__(self, config: EngineConfig) -> None:
+        from transformers import AutoTokenizer
+
+        self.config = config
+        model_dir = resolve_model_path(config.model)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        self.model = load_model(str(model_dir), config.torch_dtype, config.device)
+        self.eos_token_ids = load_eos_token_ids(model_dir)
+        self.cache = SlotKVCache.for_model(
+            self.model.cfg, config.max_num_seqs, config.max_model_len, config.torch_dtype, config.device
+        )
+        self.runner = ModelRunner(self.model, self.cache)
+        self.scheduler = Scheduler(config, self.cache, self.eos_token_ids)
+        self.sampler = Sampler(config.seed, config.device)
+        self.sequences: dict[int, Sequence] = {}
+        self.step_stats: list[StepStats] = []
+        self._next_id = 0
+
+    def add_request(
+        self,
+        prompt: str | SequenceOf[int],
+        sampling_params: SamplingParams | None = None,
+        arrival_time: float | None = None,
+    ) -> int:
+        """Queue a request; returns its id. ``prompt`` is raw text or token ids."""
+        ids = self.tokenizer(prompt).input_ids if isinstance(prompt, str) else list(prompt)
+        seq = Sequence(
+            seq_id=self._next_id,
+            prompt_token_ids=ids,
+            sampling=sampling_params or SamplingParams(),
+            arrival_time=time.perf_counter() if arrival_time is None else arrival_time,
+        )
+        self.scheduler.add(seq)  # raises if the prompt can never fit
+        self.sequences[seq.seq_id] = seq
+        self._next_id += 1
+        return seq.seq_id
+
+    def has_unfinished_requests(self) -> bool:
+        return self.scheduler.has_work()
+
+    def step(self) -> list[tuple[int, int]]:
+        """Run one engine step; returns the ``(request_id, new_token)`` pairs it produced."""
+        batch = self.scheduler.schedule()
+        new_tokens: list[tuple[int, int]] = []
+
+        for seq in batch.prefills:
+            logits = self.runner.prefill(seq.slot, seq.prompt_token_ids)
+            token = self.sampler(logits.unsqueeze(0), [seq.sampling])[0]
+            self.scheduler.append_token(seq, token, time.perf_counter())
+            new_tokens.append((seq.seq_id, token))
+
+        if batch.decodes:
+            logits = self.runner.decode([s.slot for s in batch.decodes], [s.last_token for s in batch.decodes])
+            tokens = self.sampler(logits, [s.sampling for s in batch.decodes])
+            now = time.perf_counter()
+            for seq, token in zip(batch.decodes, tokens):
+                self.scheduler.append_token(seq, token, now)
+                new_tokens.append((seq.seq_id, token))
+
+        stats = StepStats(
+            step=len(self.step_stats),
+            time=time.perf_counter(),
+            num_prefills=len(batch.prefills),
+            num_decodes=len(batch.decodes),
+            num_finished=sum(s.is_finished for s in batch.prefills + batch.decodes),
+            num_running=len(self.scheduler.running),
+            num_waiting=len(self.scheduler.waiting),
+        )
+        self.step_stats.append(stats)
+        if self.config.debug:
+            print(
+                f"step {stats.step:5d} | decode batch {stats.num_decodes:3d} | +{stats.num_prefills} joined "
+                f"| -{stats.num_finished} finished | running {stats.num_running:3d} | waiting {stats.num_waiting:4d}"
+            )
+        return new_tokens
+
+    def get_output(self, request_id: int) -> RequestOutput:
+        seq = self.sequences[request_id]
+        return RequestOutput(
+            request_id=seq.seq_id,
+            prompt_token_ids=seq.prompt_token_ids,
+            output_token_ids=list(seq.output_token_ids),
+            text=self.tokenizer.decode(seq.output_token_ids, skip_special_tokens=True),
+            finish_reason=seq.finish_reason.value if seq.finish_reason else None,
+            arrival_time=seq.arrival_time,
+            first_token_time=seq.first_token_time,
+            finish_time=seq.finish_time,
+        )
+
+    def generate(
+        self,
+        prompts: SequenceOf[str | SequenceOf[int]],
+        sampling_params: SamplingParams | SequenceOf[SamplingParams] | None = None,
+    ) -> list[RequestOutput]:
+        """Convenience loop: queue every prompt, step until all are done, return outputs in order."""
+        if sampling_params is None or isinstance(sampling_params, SamplingParams):
+            sampling_params = [sampling_params or SamplingParams()] * len(prompts)
+        ids = [self.add_request(p, sp) for p, sp in zip(prompts, sampling_params)]
+        while self.has_unfinished_requests():
+            self.step()
+        return [self.get_output(i) for i in ids]
