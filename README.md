@@ -392,7 +392,7 @@ full; recomputation is cheap here because prompts are short.
   while the actual GPU work (reading 1 GB of weights) is about 3 ms. The rest
   is Python and hundreds of small kernel launches per step. vLLM captures the
   decode step as a CUDA graph and replays it with a single launch, and its
-  scheduler is far leaner. CUDA graphs are the obvious next step (Stage 6).
+  scheduler is far leaner. CUDA graphs are the obvious next step.
 * **Attention kernels.** My decode step copies each sequence's keys and values
   out of its slot every layer before calling SDPA, and on the T4 SDPA uses the
   memory-efficient kernel (FlashAttention 2 does not support the T4). vLLM's
@@ -401,9 +401,11 @@ full; recomputation is cheap here because prompts are short.
   attention still computes the masked-out blocks between different prompts.
   Variable-length attention kernels skip them, and vLLM can also split long
   prompts into chunks (chunked prefill).
-* **Memory.** The slot cache reserves `max_model_len` tokens per request. Here
-  every backend was capped at 32 concurrent sequences, so this does not show
-  in the numbers, but with a paged cache far more sequences would fit.
+* **Memory.** The Stage 5 comparison uses the slot cache, which reserves
+  `max_model_len` tokens per request, capped at 32 sequences for every
+  backend. The paged cache (Stage 6) fixes the waste, but it still gathers
+  blocks into a temporary tensor each step instead of using a paged attention
+  kernel, and it preempts by recomputing rather than swapping to CPU memory.
 * **Measurement scope.** One GPU type, one model size, and one run per
   configuration for the Stage 5 workload (no error bars); the Stage 1 to 3
   numbers are medians of 2 to 3 repeats. The naive baseline was only run on 10
@@ -421,7 +423,7 @@ full; recomputation is cheap here because prompts are short.
 choose **Runtime → Change runtime type → T4 GPU**, then **Runtime → Run all**.
 It clones and installs the repo, runs every test and benchmark stage by stage,
 and draws the charts. Every cell is safe to re-run after a disconnect. The
-full run takes about 40 minutes; the vLLM comparison installs vLLM into a
+full run takes about 45 minutes; the vLLM comparison installs vLLM into a
 separate virtualenv so it cannot break Colab's own PyTorch.
 
 **Locally** (CPU is enough for the tests; float16 and benchmark tests are
@@ -467,7 +469,8 @@ baselines/    naive.py (no cache), hf_static.py (HF generate, static batches)
 benchmarks/   workload.py, single_request.py, static_batch.py, run_bench.py,
               vllm_bench.py, plot.py, results/ (JSON + PNG)
 scripts/      demo_continuous_batching.py, compare_fp16.py (parity debugging)
-tests/        model parity, KV cache, engine parity, scheduler, sampler
+api/          server.py (FastAPI + SSE streaming), load_test.py
+tests/        model parity, KV cache, engine parity, scheduler, sampler, API
 notebooks/    run_on_colab.ipynb
 ```
 
