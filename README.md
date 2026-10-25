@@ -13,13 +13,15 @@ lengths, **continuous batching gives 2.3x the throughput of static batching
 in the same engine (826 vs 364 tokens/s) and 3.6x Hugging Face `generate()`
 with static batching (228 tokens/s)**. Under a steady 4 requests per second,
 the 95th-percentile time to first token is **0.06 s with continuous batching
-versus 30.7 s with static batching**. Real vLLM is still 2.4x faster than my
-engine (2,002 tokens/s); [why](#honest-limitations) is explained below.
+versus 30.7 s with static batching**. Real vLLM (2,002 tokens/s) is 2.4x
+faster than that first engine.
 
-With the **paged KV cache** (Stage 6), the same KV memory runs up to 119
-sequences at once instead of 32, and throughput rises to **1,357 tokens/s**
-(1.6x the slot cache). A FastAPI server streams tokens to clients with
-Server-Sent Events.
+Stage 6 closes much of the gap. A **paged KV cache** fits 119 sequences in the
+memory that held 32, and **CUDA graphs** remove most of the per-step launch
+overhead. Together they reach **1,507 tokens/s on the same workload, 1.8x the
+slot-cache engine, with vLLM now 1.3x ahead** ([why](#honest-limitations)).
+**Prefix caching** halves the time to first token when requests share a
+system prompt, and a FastAPI server streams tokens with Server-Sent Events.
 
 ![Serving comparison](benchmarks/results/chart3_serving_comparison.png)
 
@@ -29,7 +31,7 @@ Server-Sent Events.
 2. [Architecture](#architecture)
 3. [Design decisions and trade-offs](#design-decisions-and-trade-offs)
 4. [Results](#results)
-   (plus [Stage 6: streaming server and paged KV cache](#stage-6-streaming-server-and-paged-kv-cache))
+   (plus [Stage 6: streaming server, paged KV cache, prefix caching, CUDA graphs](#stage-6-streaming-server-paged-kv-cache-prefix-caching-cuda-graphs))
 5. [Things that surprised me](#things-that-surprised-me)
 6. [Honest limitations](#honest-limitations)
 7. [How to run it](#how-to-run-it)
@@ -176,7 +178,7 @@ batch in one set of tensor operations, each row with its own settings, using a
 seeded generator so runs are reproducible.
 
 **Correctness is tested before speed.** Every stage has tests that ran on the
-T4 (28 tests, all passing). The important ones:
+T4 (45 tests, all passing). The important ones:
 
 | Test | What it checks |
 |---|---|
@@ -185,6 +187,8 @@ T4 (28 tests, all passing). The important ones:
 | `test_engine_parity.py` | 8 requests arriving at different times, queueing, joining and leaving the batch: every output identical to running that request alone (fp32 and fp16). |
 | `test_scheduler.py` | Slots reused and never shared, `max_num_seqs` respected, FIFO order, token budget, static mode, over-long prompts rejected with a clear error. |
 | `test_sampler.py` | Greedy = argmax, top-k = 1 is greedy, seeds reproduce, top-k/top-p only sample allowed tokens. |
+| `test_api.py` | Streaming returns one event per token; streaming and non-streaming text agree; 4 concurrent requests share 2 slots; errors come back as HTTP 400. |
+| `test_cuda_graphs.py` | Graph-replayed decoding gives exactly the eager outputs (fp32), and fp16 matches running each request alone, for both caches. |
 
 ## Results
 
@@ -285,7 +289,7 @@ step    64 | decode batch  21 | +11 joined | -0 finished  | running  32 | waitin
 (This demo ran before packed prefill was added, and a third of its requests
 use sampling, so its throughput is not comparable with section 3.)
 
-## Stage 6: streaming server and paged KV cache
+## Stage 6: streaming server, paged KV cache, prefix caching, CUDA graphs
 
 ### Streaming API
 
@@ -350,6 +354,70 @@ is much bigger. Each step serves more sequences, so time per token goes up,
 but every request finishes sooner. 45 preemptions show the pool really ran
 full; recomputation is cheap here because prompts are short.
 
+### Prefix caching
+
+A full block's keys and values depend only on its tokens and every token
+before it, so a block can be named by its content: its 16 tokens plus the key
+of the block before it. After a prompt is prefilled, its full blocks are
+registered under those keys. A later prompt that starts with the same tokens
+finds them and shares the blocks (reference counted) instead of recomputing
+them; it only prefills the rest, attending to the cached prefix. When nobody
+uses a cached block it returns to the free pool but keeps its contents, and is
+only overwritten when the pool needs it (least recently freed first). Tests
+check that prefilling on top of a cached prefix gives the same logits as a
+full prefill, and that outputs still match running each request alone.
+
+![Prefix caching](benchmarks/results/chart7_prefix_caching.png)
+
+Workload: 200 requests, each a shared 512-token "system prompt" plus 32 to
+128 tokens of its own, 16 to 128 output tokens; paged cache, up to 128
+sequences, same 0.40 GB of KV memory:
+
+| | Output tok/s | TTFT p50 / p95 | Max sequences | Preemptions |
+|---|---:|---:|---:|---:|
+| All at once, no prefix cache | 793 | 7.9 / 14.8 s | 54 | 11 |
+| **All at once, prefix cache** | **1,257** | **3.7 / 7.6 s** | 128 | 0 |
+| 4 req/s, no prefix cache | 276 | 47 / 108 ms | 24 | 0 |
+| **4 req/s, prefix cache** | 276 | **43 / 66 ms** | 21 | 0 |
+
+Under a burst, each request skips 512 of its roughly 600 prompt tokens, so
+TTFT halves; shared blocks also take less memory, so all 128 sequences fit
+with no preemption and throughput rises 1.6x. At a steady 4 req/s, prefills
+are already quick, so the gain is smaller (p95 TTFT 108 to 66 ms).
+
+### CUDA graphs
+
+A decode step costs ~27 ms on the T4 although the GPU work in it is a few
+ms: the rest is the CPU launching hundreds of small kernels through Python.
+[`engine/cuda_graphs.py`](engine/cuda_graphs.py) records the whole decode step
+(model plus LM head) as a CUDA graph and replays it with one launch. A graph
+replays fixed shapes at fixed addresses, so inputs go through static buffers,
+one graph is recorded per (batch size, KV length) bucket, and each step is
+rounded up to its bucket. Padding rows point at a scratch slot/block that no
+sequence owns, and the mask and write positions are computed inside the
+graph.
+
+![CUDA graphs](benchmarks/results/chart8_cuda_graphs.png)
+
+| Measurement | Eager | CUDA graphs |
+|---|---:|---:|
+| Static batch of 1 (128 tokens) | 39.5 tok/s | **113 tok/s** (2.9x) |
+| Static batch of 32 | 1,216 tok/s | **2,318 tok/s** (1.9x) |
+| 200 mixed requests, slot cache (32), offline | 826 tok/s | **1,202 tok/s** |
+| 200 mixed requests, paged cache (128), offline | 1,357 tok/s | **1,507 tok/s** |
+| 200 mixed requests, slot cache, 4 req/s: TPOT p50 | 29 ms | **14 ms** |
+
+Two lessons came out of this. First, a graph only reads memory, it does not
+own it: my first version built a small index tensor outside the graph and
+let Python free it, and every replay then read whatever reused that memory.
+The outputs were wrong (the parity tests caught it) while the speed looked
+great. Second, graphs help only while a step is limited by launches. With
+~100 sequences per step the GPU itself is busy, launches already overlap with
+GPU work, and rounding shapes up to buckets just adds work: graphing every
+batch size made the paged engine *slower* (1,139 tok/s). Finer buckets helped
+(1,235), and graphing only batches up to 32 (`cuda_graph_max_batch`) while
+larger ones run eagerly gave the best result, 1,507 tok/s.
+
 ## Things that surprised me
 
 * **Hugging Face `generate()` was not doing greedy decoding.** My first fp16
@@ -386,13 +454,15 @@ full; recomputation is cheap here because prompts are short.
 
 ## Honest limitations
 
-* **vLLM is 2.4x faster** than my slot-cache engine (1.5x faster than the
-  paged one). The main reason is per-step overhead. A decode step
-  in my engine costs about 25 to 30 ms whether it serves 1 or 32 sequences,
-  while the actual GPU work (reading 1 GB of weights) is about 3 ms. The rest
-  is Python and hundreds of small kernel launches per step. vLLM captures the
-  decode step as a CUDA graph and replays it with a single launch, and its
-  scheduler is far leaner. CUDA graphs are the obvious next step.
+* **vLLM is still faster.** On the 200-request workload it is 2.4x faster
+  than my original slot-cache engine and 1.3x faster than my best
+  configuration (paged cache + CUDA graphs, 1,507 vs 2,002 tokens/s). Per-step
+  launch overhead was the main gap, and CUDA graphs removed most of it for
+  small batches. What remains: prefill and large-batch decode still run
+  eagerly through Python, my attention copies keys and values into a
+  temporary tensor every layer (next point), graphs pad each step up to a
+  bucket, and the scheduler and sampler are plain Python with a GPU sync
+  every step.
 * **Attention kernels.** My decode step copies each sequence's keys and values
   out of its slot every layer before calling SDPA, and on the T4 SDPA uses the
   memory-efficient kernel (FlashAttention 2 does not support the T4). vLLM's
@@ -423,7 +493,7 @@ full; recomputation is cheap here because prompts are short.
 choose **Runtime → Change runtime type → T4 GPU**, then **Runtime → Run all**.
 It clones and installs the repo, runs every test and benchmark stage by stage,
 and draws the charts. Every cell is safe to re-run after a disconnect. The
-full run takes about 45 minutes; the vLLM comparison installs vLLM into a
+full run takes about 55 minutes; the vLLM comparison installs vLLM into a
 separate virtualenv so it cannot break Colab's own PyTorch.
 
 **Locally** (CPU is enough for the tests; float16 and benchmark tests are

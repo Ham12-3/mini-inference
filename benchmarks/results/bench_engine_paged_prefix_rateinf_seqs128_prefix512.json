@@ -1,0 +1,53 @@
+{
+  "name": "bench_engine_paged_prefix_rateinf_seqs128_prefix512",
+  "created_utc": "2026-10-25T12:13:03+00:00",
+  "env": {
+    "python": "3.13.16",
+    "platform": "Linux-6.6.122+-x86_64-with-glibc2.39",
+    "torch": "2.11.0+cu130",
+    "torch_cuda": "13.0",
+    "transformers": "5.20.2",
+    "cuda_available": true,
+    "gpu": "Tesla T4",
+    "gpu_capability": "7.5",
+    "gpu_memory_gb": 15.64
+  },
+  "backend": "engine_paged_prefix",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "dtype": "float16",
+  "workload": {
+    "num_requests": 200,
+    "seed": 0,
+    "rate": "inf",
+    "shared_prefix_len": 512,
+    "own_prompt_len": [
+      32,
+      128
+    ],
+    "output_len": [
+      16,
+      128
+    ],
+    "ignore_eos": true
+  },
+  "max_num_seqs": 128,
+  "kv_cache_tokens": 32768,
+  "metrics": {
+    "num_requests": 200,
+    "output_tokens": 14615,
+    "duration_s": 11.624,
+    "output_tokens_per_s": 1257.3,
+    "requests_per_s": 17.205,
+    "ttft_p50_s": 3.672,
+    "ttft_p95_s": 7.5698,
+    "tpot_p50_ms": 58.4,
+    "tpot_p95_ms": 131.2,
+    "e2e_p50_s": 9.0198,
+    "e2e_p95_s": 10.7084,
+    "peak_memory_gb": 2.089,
+    "max_concurrent_seqs": 128,
+    "preemptions": 0,
+    "prefix_hit_tokens": 106448
+  },
+  "note": "timeline omitted when copying results off Colab"
+}

@@ -358,7 +358,7 @@ def plot_prefix_caching() -> Path | None:
                                           "paged cache, up to 128 sequences"), ha="left", fontsize=8.5, color=TEXT_MUTED)
     for ax, rate, title in ((axes[0], "inf", "All 200 requests at once"), (axes[1], "4", "Poisson arrivals, 4 req/s")):
         labels, values, colors = [], [], []
-        for key, name in (("engine_paged", "Paged"), ("engine_paged_prefix", "Paged + prefix cache")):
+        for key, name in (("engine_paged", "No prefix cache"), ("engine_paged_prefix", "Prefix cache")):
             m = runs[(key, rate)]["metrics"]
             for stat in ("ttft_p50_s", "ttft_p95_s"):
                 labels.append(f"{name}\n{'p50' if stat.endswith('p50_s') else 'p95'}".replace("\n", NL))
@@ -373,7 +373,8 @@ def plot_prefix_caching() -> Path | None:
         top = max(values)
         ax.set_ylim(0, top * 1.2)
         for x, v in zip(xs, values):
-            ax.text(x, v + top * 0.02, f"{v:.2f} s" if v < 1 else f"{v:.1f} s", ha="center", fontsize=8.5, color=TEXT)
+            ax.text(x, v + top * 0.02, f"{v * 1000:.0f} ms" if v < 1 else f"{v:.1f} s", ha="center", fontsize=8.5,
+                    color=TEXT)
     path = RESULTS_DIR / "chart7_prefix_caching.png"
     fig.savefig(path, facecolor=SURFACE)
     plt.close(fig)
