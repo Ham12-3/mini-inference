@@ -132,7 +132,6 @@ def test_fp16_greedy_matches_hf_generate(model_dir, chat_prompt_ids):
         )
         ties.append(f"prompt {i}: identical for {t} tokens, then a tie (gap {gap:.4f} <= noise {noise:.4f})")
 
-    print(f"
-{identical}/{len(chat_prompt_ids)} prompts identical for {NUM_TOKENS} tokens")
+    print(f"\n{identical}/{len(chat_prompt_ids)} prompts identical for {NUM_TOKENS} tokens")
     for line in ties:
         print("  " + line)
