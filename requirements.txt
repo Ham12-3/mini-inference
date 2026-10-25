@@ -1,7 +1,7 @@
 # Lower bounds only, so Colab's preinstalled torch/transformers are reused
 # instead of being downloaded again.
 torch>=2.1
-transformers>=4.45
+transformers>=4.56
 safetensors>=0.4
 accelerate>=0.30
 huggingface_hub>=0.23

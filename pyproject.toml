@@ -13,7 +13,7 @@ license = { text = "MIT" }
 # The engine itself only needs these. Benchmark, server and test extras are below.
 dependencies = [
     "torch>=2.1",
-    "transformers>=4.45",
+    "transformers>=4.56",
     "safetensors>=0.4",
     "huggingface_hub>=0.23",
     "numpy>=1.24",
