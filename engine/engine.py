@@ -304,6 +304,16 @@ class LLMEngine:
             )
         return new_tokens
 
+    def abort_request(self, request_id: int) -> None:
+        """Cancel a request; a running one frees its cache slot immediately."""
+        self.scheduler.abort(self.sequences[request_id], time.perf_counter())
+
+    def release(self, request_id: int) -> None:
+        """Forget a finished request (a long-running server calls this to keep memory flat)."""
+        if not self.sequences[request_id].is_finished:
+            raise ValueError("only finished requests can be released")
+        del self.sequences[request_id]
+
     def get_output(self, request_id: int) -> RequestOutput:
         seq = self.sequences[request_id]
         return RequestOutput(

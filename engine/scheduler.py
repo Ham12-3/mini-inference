@@ -101,6 +101,18 @@ class Scheduler:
         if reason is not None:
             self._finish(seq, reason, now)
 
+    def abort(self, seq: Sequence, now: float) -> None:
+        """Cancel a request wherever it is: drop it from the queue, or finish it and free its slot."""
+        if seq.is_finished:
+            return
+        if seq in self.waiting:
+            self.waiting.remove(seq)
+            seq.status = SequenceStatus.FINISHED
+            seq.finish_reason = FinishReason.ABORT
+            seq.finish_time = now
+        else:
+            self._finish(seq, FinishReason.ABORT, now)
+
     def _finish(self, seq: Sequence, reason: FinishReason, now: float) -> None:
         seq.status = SequenceStatus.FINISHED
         seq.finish_reason = reason

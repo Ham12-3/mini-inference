@@ -52,6 +52,7 @@ class FinishReason(str, enum.Enum):
     EOS = "eos"  # produced an end-of-sequence token
     LENGTH = "length"  # reached its max_tokens
     MAX_MODEL_LEN = "max_model_len"  # prompt + output filled the cache slot
+    ABORT = "abort"  # cancelled by the caller (e.g. the client disconnected)
 
 
 @dataclass

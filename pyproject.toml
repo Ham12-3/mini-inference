@@ -21,7 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 bench = ["accelerate>=0.30", "matplotlib>=3.7"]
-api = ["fastapi>=0.110", "uvicorn>=0.29"]
+api = ["fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.25"]
 dev = ["pytest>=7.4"]
 
 [tool.setuptools.packages.find]

@@ -129,3 +129,16 @@ def test_static_scheduling_waits_for_the_whole_batch():
     while not b.is_finished:
         assert run_step(sched).prefills == []  # c must wait although a slot is free
     assert run_step(sched).prefills == [c]
+
+
+def test_abort_frees_slot_or_leaves_queue():
+    sched, cache = make_scheduler(max_num_seqs=1)
+    running, queued = make_seq(0, 5, max_tokens=10), make_seq(1, 5, max_tokens=10)
+    sched.add(running)
+    sched.add(queued)
+    run_step(sched)
+    sched.abort(queued, now=0.0)  # still waiting: just leaves the queue
+    assert queued.finish_reason is FinishReason.ABORT and not sched.waiting
+    sched.abort(running, now=0.0)  # running: finishes and frees its slot
+    assert running.finish_reason is FinishReason.ABORT and cache.num_free_slots == 1
+    assert not sched.has_work()
