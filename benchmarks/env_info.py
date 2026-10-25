@@ -14,13 +14,11 @@ import argparse
 import json
 import platform
 import sys
-from pathlib import Path
 from typing import Any
 
 import torch
 
-# Files we need from the Hub: weights, model config, tokenizer and generation config.
-MODEL_FILE_PATTERNS = ["*.json", "*.safetensors", "*.txt", "*.model"]
+from engine.loader import resolve_model_path
 
 
 def collect_env() -> dict[str, Any]:
@@ -45,15 +43,6 @@ def collect_env() -> dict[str, Any]:
     return info
 
 
-def download_model(model: str) -> Path:
-    """Download (or reuse the cached copy of) a model from the Hub and return its local directory."""
-    from huggingface_hub import snapshot_download
-
-    if Path(model).is_dir():
-        return Path(model)
-    return Path(snapshot_download(model, allow_patterns=MODEL_FILE_PATTERNS))
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
@@ -63,7 +52,7 @@ def main() -> None:
     print(json.dumps(collect_env(), indent=2))
 
     print(f"\n== Downloading {args.model}")
-    path = download_model(args.model)
+    path = resolve_model_path(args.model)
     size_gb = sum(f.stat().st_size for f in path.glob("*.safetensors")) / 1e9
     print(f"local dir: {path}")
     print(f"weights:   {size_gb:.2f} GB in {len(list(path.glob('*.safetensors')))} safetensors file(s)")

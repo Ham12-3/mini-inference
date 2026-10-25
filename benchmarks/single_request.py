@@ -16,8 +16,8 @@ from typing import Callable
 
 import torch
 
-from benchmarks.env_info import download_model
 from benchmarks.report import save_results
+from engine.loader import resolve_model_path
 
 PROMPT = "Explain, step by step, how a CPU cache works and why it makes programs faster."
 
@@ -36,8 +36,36 @@ def make_naive_backend(model_path: str, dtype: torch.dtype, device: str) -> Gene
     return lambda ids, n: naive_generate(model, ids, n, eos_token_id=None)
 
 
+def make_hf_kv_backend(model_path: str, dtype: torch.dtype, device: str) -> GenerateFn:
+    """Hugging Face ``generate()`` with its own KV cache: the reference for "how fast should a cache be"."""
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype, attn_implementation="sdpa")
+    model.to(device).eval()
+
+    @torch.inference_mode()
+    def generate(ids: torch.Tensor, n: int) -> list[int]:
+        out = model.generate(ids, max_new_tokens=n, min_new_tokens=n, do_sample=False, pad_token_id=0)
+        return out[0, ids.shape[1] :].tolist()
+
+    return generate
+
+
+def make_engine_kv_backend(model_path: str, dtype: torch.dtype, device: str) -> GenerateFn:
+    """My Qwen2 implementation with the single-sequence KV cache (Stage 2)."""
+    from engine.engine import generate_greedy
+    from engine.kv_cache import SingleSequenceKVCache
+    from engine.loader import load_model
+
+    model = load_model(model_path, dtype, device)
+    cache = SingleSequenceKVCache.for_model(model.cfg, max_len=4096, dtype=dtype, device=device)
+    return lambda ids, n: generate_greedy(model, ids[0].tolist(), n, cache, eos_token_ids=())
+
+
 BACKENDS: dict[str, Callable[[str, torch.dtype, str], GenerateFn]] = {
     "naive": make_naive_backend,
+    "hf_kv": make_hf_kv_backend,
+    "engine_kv": make_engine_kv_backend,
 }
 
 
@@ -76,7 +104,7 @@ def main() -> None:
     args = parser.parse_args()
 
     dtype = getattr(torch, args.dtype)
-    model_path = str(download_model(args.model))
+    model_path = str(resolve_model_path(args.model))
     generate = BACKENDS[args.backend](model_path, dtype, args.device)
     ids = build_prompt_ids(model_path, args.device)
 
