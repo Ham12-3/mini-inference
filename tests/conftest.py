@@ -3,13 +3,14 @@ import torch
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 
-# Varied prompts: chat, code, maths, a list, plain continuation.
+# Varied prompts (explanation, code, maths, a list, a story), each with a
+# long enough answer that the fp16 parity test really compares 50 tokens.
 PROMPTS = [
     "Explain, step by step, how a CPU cache works.",
     "Write a Python function that checks whether a string is a palindrome.",
     "What is 17 multiplied by 23? Show your working.",
     "List five interesting facts about octopuses.",
-    "Translate into French: The weather is lovely today and I want to go for a walk.",
+    "Write a short story about a robot who learns to paint.",
 ]
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

@@ -38,14 +38,17 @@ def make_naive_backend(model_path: str, dtype: torch.dtype, device: str) -> Gene
 
 def make_hf_kv_backend(model_path: str, dtype: torch.dtype, device: str) -> GenerateFn:
     """Hugging Face ``generate()`` with its own KV cache: the reference for "how fast should a cache be"."""
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoModelForCausalLM, GenerationConfig
 
     model = AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype, attn_implementation="sdpa")
     model.to(device).eval()
 
     @torch.inference_mode()
     def generate(ids: torch.Tensor, n: int) -> list[int]:
-        out = model.generate(ids, max_new_tokens=n, min_new_tokens=n, do_sample=False, pad_token_id=0)
+        # A fresh GenerationConfig: the model's own one adds repetition_penalty=1.1,
+        # which is extra work (and not greedy). min_new_tokens forces exactly n tokens.
+        cfg = GenerationConfig(do_sample=False, max_new_tokens=n, min_new_tokens=n, pad_token_id=0)
+        out = model.generate(ids, generation_config=cfg)
         return out[0, ids.shape[1] :].tolist()
 
     return generate

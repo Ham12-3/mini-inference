@@ -17,6 +17,27 @@ FP32_TOL = 1e-3
 NUM_TOKENS = 50
 
 
+def hf_greedy(hf, ids, max_new_tokens, eos, min_new_tokens=0):
+    """Plain greedy decoding with HF ``generate()``.
+
+    We pass a fresh GenerationConfig on purpose. Qwen2.5-Instruct ships a
+    generation_config.json with ``repetition_penalty: 1.1``, and HF applies it
+    even when ``do_sample=False``. That is not greedy decoding, and it made HF
+    pick a different token from its own argmax whenever the best token had
+    already appeared in the text.
+    """
+    from transformers import GenerationConfig
+
+    cfg = GenerationConfig(
+        do_sample=False,
+        max_new_tokens=max_new_tokens,
+        min_new_tokens=min_new_tokens,
+        eos_token_id=eos,
+        pad_token_id=eos[0],
+    )
+    return hf.generate(ids, generation_config=cfg)[0, ids.shape[1] :].tolist()
+
+
 def load_hf(model_dir, dtype):
     from transformers import AutoModelForCausalLM
 
@@ -55,7 +76,7 @@ def test_fp32_cached_decode_logits_match(fp32_models, chat_prompt_ids, model_dir
 
     # Get 20 continuation tokens to feed (from HF's own greedy run).
     seq = torch.tensor([prompt], device=DEVICE)
-    full = hf.generate(seq, max_new_tokens=20, min_new_tokens=20, do_sample=False, pad_token_id=0)
+    full = torch.tensor([prompt + hf_greedy(hf, seq, 20, load_eos_token_ids(model_dir), min_new_tokens=20)], device=DEVICE)
     ref_logits = hf(input_ids=full).logits[0]  # [len, vocab], full forward, no cache
 
     hidden = mine(seq, torch.arange(len(prompt), device=DEVICE).unsqueeze(0), cache)
@@ -81,7 +102,7 @@ def test_fp16_greedy_matches_hf_generate(model_dir, chat_prompt_ids):
 
     for i, prompt in enumerate(chat_prompt_ids):
         ids = torch.tensor([prompt], device="cuda")
-        ref = hf.generate(ids, max_new_tokens=NUM_TOKENS, do_sample=False, pad_token_id=eos[0])
-        ref = ref[0, len(prompt) :].tolist()
+        ref = hf_greedy(hf, ids, NUM_TOKENS, eos)
+        assert len(ref) == NUM_TOKENS, f"prompt {i} hit EOS after {len(ref)} tokens; pick a longer-answer prompt"
         got = generate_greedy(mine, prompt, NUM_TOKENS, cache, eos_token_ids=eos)
         assert got == ref, f"prompt {i}: first mismatch at token {next(j for j, (a, b) in enumerate(zip(got + [-1], ref + [-1])) if a != b)}"

@@ -1,5 +1,10 @@
 """Debug tool: find where my fp16 model and HF's fp16 model first disagree in greedy decoding.
 
+Kept because it found a real issue: HF ``generate()`` applies the model's
+``repetition_penalty: 1.1`` from generation_config.json even with
+``do_sample=False``, so it is not plain greedy unless given a fresh
+GenerationConfig. ``--model-generation-config`` reproduces that.
+
 For each parity prompt it reports the first differing token and, at that
 step, both models' top-2 tokens and the gap between them. A tiny gap means a
 near-tie that any rounding difference can flip; a large gap means a real bug.
@@ -55,11 +60,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--unfused", action="store_true")
     parser.add_argument("--tokens", type=int, default=50)
+    parser.add_argument(
+        "--model-generation-config",
+        action="store_true",
+        help="let HF generate() use the model's generation_config.json (repetition_penalty=1.1), "
+        "which reproduces the original mismatch",
+    )
     args = parser.parse_args()
     if args.unfused:
         unfuse()
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
     model_dir = resolve_model_path(MODEL_ID)
     tok = AutoTokenizer.from_pretrained(model_dir)
@@ -72,7 +83,12 @@ def main() -> None:
         chat = tok.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True)
         prompt = tok(chat).input_ids
         ids = torch.tensor([prompt], device="cuda")
-        ref = hf.generate(ids, max_new_tokens=args.tokens, do_sample=False, pad_token_id=eos[0])[0, len(prompt) :].tolist()
+        gen_cfg = GenerationConfig(do_sample=False, max_new_tokens=args.tokens, eos_token_id=eos, pad_token_id=eos[0])
+        if args.model_generation_config:
+            ref = hf.generate(ids, max_new_tokens=args.tokens, do_sample=False, pad_token_id=eos[0])
+        else:
+            ref = hf.generate(ids, generation_config=gen_cfg)
+        ref = ref[0, len(prompt) :].tolist()
         got = generate_greedy(mine, prompt, args.tokens, cache, eos_token_ids=eos)
         if got == ref:
             print(f"prompt {n}: identical ({len(ref)} tokens)")
