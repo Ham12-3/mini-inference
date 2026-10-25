@@ -27,7 +27,7 @@ GRID = "#e4e3df"
 BACKEND_STYLE = {
     "engine": ("#2a78d6", "My engine"),
     "naive": ("#eb6834", "Naive (no KV cache)"),
-    "hf": ("#1baf7a", "Hugging Face"),
+    "hf": ("#1baf7a", "HF generate()"),
     "vllm": ("#eda100", "vLLM"),
 }
 
