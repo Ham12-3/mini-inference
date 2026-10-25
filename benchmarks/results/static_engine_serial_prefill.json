@@ -1,0 +1,90 @@
+{
+  "name": "static_engine_serial_prefill",
+  "created_utc": "2026-10-25T10:15:48+00:00",
+  "env": {
+    "python": "3.13.16",
+    "platform": "Linux-6.6.122+-x86_64-with-glibc2.39",
+    "torch": "2.11.0+cu130",
+    "torch_cuda": "13.0",
+    "transformers": "5.20.2",
+    "cuda_available": true,
+    "gpu": "Tesla T4",
+    "gpu_capability": "7.5",
+    "gpu_memory_gb": 15.64
+  },
+  "backend": "engine_serial_prefill",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "dtype": "float16",
+  "output_len": 128,
+  "prompt_lens": [
+    48,
+    43,
+    36,
+    42,
+    39,
+    38,
+    39,
+    37,
+    42,
+    42,
+    40,
+    37,
+    43,
+    35,
+    39,
+    46
+  ],
+  "repeats": 2,
+  "runs": [
+    {
+      "batch_size": 1,
+      "seconds": [
+        3.303769650000504,
+        3.139086098000007
+      ],
+      "median_seconds": 3.2214278740002555,
+      "tokens_per_s": 39.733933214234625,
+      "peak_memory_gb": 1.420893184
+    },
+    {
+      "batch_size": 4,
+      "seconds": [
+        3.2212724590008293,
+        3.27112677399964
+      ],
+      "median_seconds": 3.2461996165002347,
+      "tokens_per_s": 157.7228946111432,
+      "peak_memory_gb": 1.424870912
+    },
+    {
+      "batch_size": 8,
+      "seconds": [
+        3.3613014150005256,
+        3.4555872760001876
+      ],
+      "median_seconds": 3.4084443455003566,
+      "tokens_per_s": 300.4303125417991,
+      "peak_memory_gb": 1.431354368
+    },
+    {
+      "batch_size": 16,
+      "seconds": [
+        3.5901735710003777,
+        3.5087339820001944
+      ],
+      "median_seconds": 3.549453776500286,
+      "tokens_per_s": 576.9901874928205,
+      "peak_memory_gb": 1.443097088
+    },
+    {
+      "batch_size": 32,
+      "seconds": [
+        3.9958701049999945,
+        4.108726991999902
+      ],
+      "median_seconds": 4.052298548499948,
+      "tokens_per_s": 1010.7843612648503,
+      "peak_memory_gb": 1.46743808
+    }
+  ]
+}
