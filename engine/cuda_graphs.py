@@ -51,11 +51,18 @@ class _GraphDecodeContext:
             self.tables = owner.tables[:batch, : kv_len // owner.cache.block_size]
         else:
             self.slots = owner.slots[:batch]
-        self.key_index = torch.arange(kv_len, device=owner.device)
+        self.device = owner.device
 
     def prepare(self) -> None:
-        """Run inside the graph, once per step, before the layers."""
-        self.mask = (self.key_index <= self.positions.unsqueeze(1))[:, None, None, :]
+        """Run inside the graph, once per step, before the layers.
+
+        Everything here is (re)computed on every replay from the static
+        buffers. A tensor made *outside* the graph and only referenced by it
+        would be a bug waiting to happen: if Python freed it, the graph would
+        keep reading whatever later reused that memory.
+        """
+        key_index = torch.arange(self.kv_len, device=self.device)
+        self.mask = (key_index <= self.positions.unsqueeze(1))[:, None, None, :]
         if self.paged:
             bs = self.cache.block_size
             self.write_blocks = self.tables.gather(1, (self.positions // bs).unsqueeze(1)).squeeze(1)
@@ -103,7 +110,9 @@ class GraphedDecoder:
             self.tables = torch.full((top, max_blocks), cache.scratch_block, dtype=torch.long, device=self.device)
         else:
             self.slots = torch.full((top,), cache.scratch_slot, dtype=torch.long, device=self.device)
-        self.graphs: dict[tuple[int, int], tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
+        # (batch, kv_len) -> (graph, its output logits, its context). The context
+        # is kept alive with the graph on purpose: the graph reads its tensors.
+        self.graphs: dict[tuple[int, int], tuple[torch.cuda.CUDAGraph, torch.Tensor, _GraphDecodeContext]] = {}
         self._pool = None
         self.replays = 0  # decode steps served by a graph (the rest fell back to eager)
 
@@ -139,7 +148,7 @@ class GraphedDecoder:
         with torch.cuda.graph(graph, pool=self._pool):
             logits = step()
         self._pool = graph.pool()
-        self.graphs[(batch, kv_len)] = (graph, logits)
+        self.graphs[(batch, kv_len)] = (graph, logits, ctx)
 
     def decode(self, slots: Sequence[int], last_tokens: Sequence[int]) -> torch.Tensor | None:
         """One decode step via a captured graph; returns logits ``[len(slots), vocab]`` or None."""
@@ -149,7 +158,7 @@ class GraphedDecoder:
         kv_len = next((k for k in self.kv_buckets if k > max(positions)), None)
         if batch is None or kv_len is None or (batch, kv_len) not in self.graphs:
             return None
-        graph, logits = self.graphs[(batch, kv_len)]
+        graph, logits, _ = self.graphs[(batch, kv_len)]
 
         # Fill the static inputs; padding rows use the scratch slot/block.
         self.ids[:n, 0] = torch.tensor(list(last_tokens), device=self.device)
