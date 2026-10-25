@@ -249,7 +249,7 @@ class LLMEngine:
             )
         self.runner = ModelRunner(self.model, self.cache)
         if config.cuda_graphs:
-            self.runner.enable_cuda_graphs(config.max_num_seqs)
+            self.runner.enable_cuda_graphs(min(config.max_num_seqs, config.cuda_graph_max_batch))
         self.scheduler = Scheduler(config, self.cache, self.eos_token_ids)
         self.sampler = Sampler(config.seed, config.device)
         self.sequences: dict[int, Sequence] = {}

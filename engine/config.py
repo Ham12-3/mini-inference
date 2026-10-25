@@ -51,6 +51,11 @@ class EngineConfig:
         cuda_graphs: Record the decode step as CUDA graphs (one per batch-size
             and KV-length bucket) and replay them, removing most per-step
             CPU launch overhead. CUDA only.
+        cuda_graph_max_batch: Largest decode batch run from a graph; bigger
+            batches run eagerly. Graphs pay off while a step is limited by
+            kernel launches (small batches); once the GPU itself is the
+            bottleneck, launches already overlap with GPU work and the
+            graphs' padded shapes only add work.
         batched_prefill: Pack several new prompts into one prefill forward pass
             (up to max_num_batched_tokens tokens). False prefills one prompt
             per forward pass, the simpler Stage 3/4 behaviour.
@@ -71,6 +76,7 @@ class EngineConfig:
     kv_cache_tokens: int | None = None
     batched_prefill: bool = True
     cuda_graphs: bool = False
+    cuda_graph_max_batch: int = 32
     seed: int = 0
     debug: bool = False
 
