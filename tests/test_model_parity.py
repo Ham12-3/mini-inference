@@ -20,22 +20,19 @@ NUM_TOKENS = 50
 def hf_greedy(hf, ids, max_new_tokens, eos, min_new_tokens=0):
     """Plain greedy decoding with HF ``generate()``.
 
-    We pass a fresh GenerationConfig on purpose. Qwen2.5-Instruct ships a
-    generation_config.json with ``repetition_penalty: 1.1``, and HF applies it
-    even when ``do_sample=False``. That is not greedy decoding, and it made HF
-    pick a different token from its own argmax whenever the best token had
-    already appeared in the text.
+    Qwen2.5-Instruct ships a generation_config.json with
+    ``repetition_penalty: 1.1``, and HF applies it even when
+    ``do_sample=False``. That is not greedy decoding: it made HF pick a
+    different token from its own argmax whenever the best token had already
+    appeared in the text. Passing a fresh GenerationConfig to ``generate()``
+    is not enough (transformers merges it with the model's saved one), so we
+    replace the model's generation config itself.
     """
     from transformers import GenerationConfig
 
-    cfg = GenerationConfig(
-        do_sample=False,
-        max_new_tokens=max_new_tokens,
-        min_new_tokens=min_new_tokens,
-        eos_token_id=eos,
-        pad_token_id=eos[0],
-    )
-    return hf.generate(ids, generation_config=cfg)[0, ids.shape[1] :].tolist()
+    hf.generation_config = GenerationConfig(do_sample=False, eos_token_id=eos, pad_token_id=eos[0])
+    out = hf.generate(ids, max_new_tokens=max_new_tokens, min_new_tokens=min_new_tokens)
+    return out[0, ids.shape[1] :].tolist()
 
 
 def load_hf(model_dir, dtype):

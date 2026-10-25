@@ -2,8 +2,9 @@
 
 Kept because it found a real issue: HF ``generate()`` applies the model's
 ``repetition_penalty: 1.1`` from generation_config.json even with
-``do_sample=False``, so it is not plain greedy unless given a fresh
-GenerationConfig. ``--model-generation-config`` reproduces that.
+``do_sample=False``. Passing a fresh GenerationConfig to ``generate()`` does
+not help (it is merged with the saved one), so we replace
+``hf.generation_config``. ``--model-generation-config`` reproduces the issue.
 
 For each parity prompt it reports the first differing token and, at that
 step, both models' top-2 tokens and the gap between them. A tiny gap means a
@@ -77,17 +78,16 @@ def main() -> None:
     hf = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float16, attn_implementation="sdpa").cuda().eval()
     mine = load_model(str(model_dir), torch.float16, "cuda")
     eos = load_eos_token_ids(model_dir)
+    if not args.model_generation_config:
+        # Plain greedy: replace (not just override) the saved config, see module docstring.
+        hf.generation_config = GenerationConfig(do_sample=False, eos_token_id=eos, pad_token_id=eos[0])
     cache = SingleSequenceKVCache.for_model(mine.cfg, 1024, torch.float16, "cuda")
 
     for n, text in enumerate(PROMPTS):
         chat = tok.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True)
         prompt = tok(chat).input_ids
         ids = torch.tensor([prompt], device="cuda")
-        gen_cfg = GenerationConfig(do_sample=False, max_new_tokens=args.tokens, eos_token_id=eos, pad_token_id=eos[0])
-        if args.model_generation_config:
-            ref = hf.generate(ids, max_new_tokens=args.tokens, do_sample=False, pad_token_id=eos[0])
-        else:
-            ref = hf.generate(ids, generation_config=gen_cfg)
+        ref = hf.generate(ids, max_new_tokens=args.tokens, do_sample=False, pad_token_id=eos[0])
         ref = ref[0, len(prompt) :].tolist()
         got = generate_greedy(mine, prompt, args.tokens, cache, eos_token_ids=eos)
         if got == ref:

@@ -42,13 +42,15 @@ def make_hf_kv_backend(model_path: str, dtype: torch.dtype, device: str) -> Gene
 
     model = AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype, attn_implementation="sdpa")
     model.to(device).eval()
+    # Replace the model's saved generation config: it adds repetition_penalty=1.1,
+    # which is extra work and not greedy. (Passing a config to generate() is not
+    # enough; transformers merges it with this one.)
+    model.generation_config = GenerationConfig(do_sample=False, pad_token_id=0)
 
     @torch.inference_mode()
     def generate(ids: torch.Tensor, n: int) -> list[int]:
-        # A fresh GenerationConfig: the model's own one adds repetition_penalty=1.1,
-        # which is extra work (and not greedy). min_new_tokens forces exactly n tokens.
-        cfg = GenerationConfig(do_sample=False, max_new_tokens=n, min_new_tokens=n, pad_token_id=0)
-        out = model.generate(ids, generation_config=cfg)
+        # min_new_tokens forces exactly n tokens (EOS is masked until then).
+        out = model.generate(ids, max_new_tokens=n, min_new_tokens=n)
         return out[0, ids.shape[1] :].tolist()
 
     return generate
