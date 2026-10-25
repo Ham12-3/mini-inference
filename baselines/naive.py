@@ -13,6 +13,8 @@ first chart: it shows what the KV cache (Stage 2) saves us.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 
 
@@ -22,6 +24,7 @@ def naive_generate(
     input_ids: torch.Tensor,
     max_new_tokens: int,
     eos_token_id: int | None = None,
+    on_token: Callable[[int], None] | None = None,
 ) -> list[int]:
     """Greedy-decode up to ``max_new_tokens`` tokens for one sequence, recomputing everything each step.
 
@@ -31,6 +34,8 @@ def naive_generate(
         max_new_tokens: How many tokens to generate.
         eos_token_id: Stop early when this token is produced. ``None`` always
             generates exactly ``max_new_tokens`` tokens (what the benchmark wants).
+        on_token: Optional callback run with each new token as soon as it is
+            known (the benchmark uses it to time the first token).
 
     Returns:
         The generated token ids (prompt not included).
@@ -43,6 +48,8 @@ def naive_generate(
         logits = model(input_ids=ids, use_cache=False).logits[:, -1, :]
         next_id = logits.argmax(dim=-1, keepdim=True)  # greedy: [1, 1]
         generated.append(int(next_id))
+        if on_token is not None:
+            on_token(generated[-1])
         if eos_token_id is not None and generated[-1] == eos_token_id:
             break
         ids = torch.cat([ids, next_id], dim=1)

@@ -14,9 +14,9 @@ EOS = 0
 TOKEN = 7  # a fake non-EOS token
 
 
-def make_scheduler(max_num_seqs=4, max_model_len=64, max_num_batched_tokens=128):
+def make_scheduler(max_num_seqs=4, max_model_len=64, max_num_batched_tokens=128, scheduling="continuous"):
     cfg = EngineConfig(device="cpu", max_num_seqs=max_num_seqs, max_model_len=max_model_len,
-                       max_num_batched_tokens=max_num_batched_tokens)
+                       max_num_batched_tokens=max_num_batched_tokens, scheduling=scheduling)
     cache = SlotKVCache(num_layers=1, num_kv_heads=1, head_dim=4, num_slots=max_num_seqs,
                         max_len=max_model_len, dtype=torch.float32, device="cpu")
     return Scheduler(cfg, cache, eos_token_ids=[EOS]), cache
@@ -117,3 +117,15 @@ def test_finish_reasons():
     assert long_seq.finish_reason is FinishReason.MAX_MODEL_LEN
     assert long_seq.num_tokens == 16
     assert cache.num_free_slots == 2
+
+
+def test_static_scheduling_waits_for_the_whole_batch():
+    sched, cache = make_scheduler(max_num_seqs=2, scheduling="static")
+    a, b, c = make_seq(0, 5, max_tokens=1), make_seq(1, 5, max_tokens=4), make_seq(2, 5, max_tokens=4)
+    for s in (a, b, c):
+        sched.add(s)
+    run_step(sched)  # a and b admitted; a finishes at once, freeing a slot
+    assert a.is_finished and cache.num_free_slots == 1
+    while not b.is_finished:
+        assert run_step(sched).prefills == []  # c must wait although a slot is free
+    assert run_step(sched).prefills == [c]

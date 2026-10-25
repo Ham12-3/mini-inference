@@ -182,6 +182,62 @@ class SlotKVCache:
     def decode_context(self, slots: Sequence[int]) -> SlotDecodeContext:
         return SlotDecodeContext(self, slots)
 
+    def packed_prefill_context(self, slots: Sequence[int], lengths: Sequence[int]) -> PackedPrefillContext:
+        return PackedPrefillContext(self, slots, lengths)
+
+
+class PackedPrefillContext:
+    """Prefill several fresh prompts in ONE forward pass by packing them end to end.
+
+    The prompts are concatenated into a single row of N tokens (no padding).
+    Every token keeps its own position *within its prompt* for RoPE, and
+    attention uses a block-diagonal causal mask: a token may only see earlier
+    tokens of the same prompt.
+
+        prompt A: a0 a1 a2    prompt B: b0 b1        mask (1 = may attend)
+        packed:   a0 a1 a2 b0 b1                     a0: 1 . . . .
+                                                     a1: 1 1 . . .
+                                                     a2: 1 1 1 . .
+                                                     b0: . . . 1 .
+                                                     b1: . . . 1 1
+
+    Why bother: each prefill forward pass costs a fixed ~25 ms of launch
+    overhead on the T4, whatever its length. Prefilling 32 prompts one by
+    one pays that 32 times. Packing pays it once, and the matmuls get bigger
+    and more efficient. The mask is N x N, so callers keep N within the
+    step's token budget.
+    """
+
+    def __init__(self, cache: SlotKVCache, slots: Sequence[int], lengths: Sequence[int]) -> None:
+        self.cache = cache
+        self.slots = list(slots)
+        self.lengths = list(lengths)
+        if any(cache.lengths[s] != 0 for s in self.slots):
+            raise ValueError("packed prefill only handles fresh prompts (slot length 0)")
+        if max(self.lengths) > cache.max_len:
+            raise ValueError(f"a prompt exceeds the cache slot size {cache.max_len}")
+        device = cache.k.device
+        # Per packed token: which prompt it belongs to, and its position in that prompt.
+        seg = torch.repeat_interleave(torch.arange(len(self.slots), device=device),
+                                      torch.tensor(self.lengths, device=device))
+        self.positions = torch.cat([torch.arange(n, device=device) for n in self.lengths])
+        self.token_slots = torch.tensor(self.slots, device=device)[seg]
+        index = torch.arange(len(seg), device=device)
+        self.mask = (seg.unsqueeze(1) == seg.unsqueeze(0)) & (index.unsqueeze(0) <= index.unsqueeze(1))
+        # Index of each prompt's last token: its logits predict the first output token.
+        self.last_index = torch.tensor(self.lengths, device=device).cumsum(0) - 1
+
+    def attend(self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        # Scatter every packed token's k/v to (its slot, its position) in one write.
+        # k[0] is [heads, N, head_dim]; the indexed target is [N, heads, head_dim].
+        self.cache.k[layer_idx][self.token_slots, :, self.positions] = k[0].transpose(0, 1)
+        self.cache.v[layer_idx][self.token_slots, :, self.positions] = v[0].transpose(0, 1)
+        return sdpa_attention(q, k, v, attn_mask=self.mask)
+
+    def commit(self) -> None:
+        for slot, n in zip(self.slots, self.lengths):
+            self.cache.lengths[slot] = n
+
 
 class SlotPrefillContext:
     """Attention for one sequence's prompt tokens, written into its slot."""

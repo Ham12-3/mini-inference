@@ -61,10 +61,16 @@ class Scheduler:
     def schedule(self) -> SchedulerOutput:
         """Choose this step's prefills and decodes."""
         out = SchedulerOutput(decodes=list(self.running))
+        static = self.config.scheduling == "static"
+        if static and self.running:
+            return out  # static batching: nobody joins until the whole batch is done
         budget = self.config.max_num_batched_tokens - len(out.decodes)
         while self.waiting and self.cache.num_free_slots > 0 and len(self.running) < self.config.max_num_seqs:
             seq = self.waiting[0]
-            if seq.prompt_len > budget:
+            # The token budget protects running decodes from a long burst of
+            # prefills. A static batch has no running decodes, so it fills
+            # every slot at once instead.
+            if seq.prompt_len > budget and not static:
                 # Strict FIFO: do not let a later, shorter prompt jump the
                 # queue. The budget refills next step; with nothing running
                 # it is at least max_model_len, so every valid prompt fits.

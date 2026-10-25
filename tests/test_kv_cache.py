@@ -11,7 +11,7 @@ import pytest
 import torch
 from conftest import DEVICE, requires_gpu
 
-from engine.engine import ModelRunner, generate_greedy, generate_static
+from engine.engine import ModelRunner, generate_greedy, generate_static, pack_by_budget
 from engine.kv_cache import SingleSequenceKVCache, SlotKVCache
 from engine.loader import load_eos_token_ids, load_model
 from engine.model import decode_attention, sdpa_attention
@@ -91,7 +91,7 @@ def run_static_vs_single(model_dir, chat_prompt_ids, dtype, device, num_tokens):
 
     cache = SlotKVCache.for_model(model.cfg, num_slots=8, max_len=1024, dtype=dtype, device=device)
     runner = ModelRunner(model, cache)
-    got = generate_static(runner, chat_prompt_ids, num_tokens, eos_token_ids=eos)
+    got = generate_static(runner, chat_prompt_ids, num_tokens, eos_token_ids=eos, prefill_budget=4096)
     assert cache.num_free_slots == 8  # every slot handed back
     return expected, got
 
@@ -108,3 +108,48 @@ def test_static_batch_matches_single_fp16(model_dir, chat_prompt_ids):
     expected, got = run_static_vs_single(model_dir, chat_prompt_ids, torch.float16, "cuda", num_tokens=50)
     for i, (e, g) in enumerate(zip(expected, got)):
         assert g == e, f"prompt {i}: batched output differs from single-sequence output"
+
+
+def test_pack_by_budget():
+    assert pack_by_budget([10, 20, 30, 5], budget=35) == [[0, 1], [2, 3]]
+    assert pack_by_budget([50, 10], budget=35) == [[0], [1]]  # an oversized item gets its own group
+    assert pack_by_budget([10, 20, 30], budget=0) == [[0], [1], [2]]  # 0 = one at a time
+
+
+@torch.inference_mode()
+def test_packed_prefill_attention_and_cache_writes():
+    """Packing prompts end to end must equal prefilling each alone."""
+    torch.manual_seed(0)
+    cache = tiny_cache(num_slots=4, max_len=16)
+    heads, kv_heads, dim = 4, 2, 8
+    lengths, slots = [5, 3, 7], [2, 0, 3]
+    total = sum(lengths)
+    q, k, v = torch.randn(1, heads, total, dim), torch.randn(1, kv_heads, total, dim), torch.randn(1, kv_heads, total, dim)
+
+    ctx = cache.packed_prefill_context(slots, lengths)
+    assert ctx.positions.tolist() == [0, 1, 2, 3, 4, 0, 1, 2, 0, 1, 2, 3, 4, 5, 6]
+    out = ctx.attend(0, q, k, v)
+    ctx.commit()
+
+    start = 0
+    for slot, n in zip(slots, lengths):
+        seg = slice(start, start + n)
+        ref = sdpa_attention(q[:, :, seg], k[:, :, seg], v[:, :, seg], is_causal=True)
+        torch.testing.assert_close(out[:, :, seg], ref, rtol=1e-5, atol=1e-6)
+        assert torch.equal(cache.k[0, slot, :, :n], k[0, :, seg])
+        assert cache.lengths[slot] == n
+        start += n
+
+
+@torch.inference_mode()
+def test_packed_prefill_logits_match_individual_prefill(model_dir, chat_prompt_ids):
+    model = load_model(str(model_dir), torch.float32, DEVICE)
+    prompts = chat_prompt_ids[:3]
+    one = ModelRunner(model, SlotKVCache.for_model(model.cfg, 4, 256, torch.float32, DEVICE))
+    packed = ModelRunner(model, SlotKVCache.for_model(model.cfg, 4, 256, torch.float32, DEVICE))
+    ref = torch.stack([one.prefill(one.cache.allocate(), p) for p in prompts])
+    slots = [packed.cache.allocate() for _ in prompts]
+    got = packed.prefill_packed(slots, prompts)
+    torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-3)
+    for s, p in zip(slots, prompts):
+        torch.testing.assert_close(packed.cache.k[:, s, :, : len(p)], one.cache.k[:, s, :, : len(p)], rtol=1e-4, atol=1e-4)

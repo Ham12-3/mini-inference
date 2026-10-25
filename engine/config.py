@@ -33,6 +33,13 @@ class EngineConfig:
         max_num_batched_tokens: Token budget for one engine step. It limits how
             many prompt tokens we prefill in a single step so a burst of long
             prompts cannot stall the running decodes for too long.
+        scheduling: "continuous" (default): requests join and leave the running
+            batch every step. "static": a new batch is admitted only when the
+            previous one has completely finished (the baseline continuous
+            batching is compared against).
+        batched_prefill: Pack several new prompts into one prefill forward pass
+            (up to max_num_batched_tokens tokens). False prefills one prompt
+            per forward pass, the simpler Stage 3/4 behaviour.
         seed: Seed for the sampler's random generator, so sampled runs are reproducible.
         debug: Print the batch composition on every step.
     """
@@ -43,6 +50,8 @@ class EngineConfig:
     max_num_seqs: int = 32
     max_model_len: int = 2048
     max_num_batched_tokens: int = 4096
+    scheduling: str = "continuous"
+    batched_prefill: bool = True
     seed: int = 0
     debug: bool = False
 
@@ -53,6 +62,8 @@ class EngineConfig:
             raise ValueError("max_num_seqs must be at least 1")
         if self.max_model_len < 2:
             raise ValueError("max_model_len must be at least 2")
+        if self.scheduling not in ("continuous", "static"):
+            raise ValueError(f"scheduling must be 'continuous' or 'static', got {self.scheduling!r}")
         if self.max_num_batched_tokens < self.max_model_len:
             # Otherwise a prompt of max length could never be admitted.
             raise ValueError("max_num_batched_tokens must be >= max_model_len")

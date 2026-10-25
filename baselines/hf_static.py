@@ -34,12 +34,14 @@ def hf_static_generate(
     max_new_tokens: int,
     pad_token_id: int,
     eos_token_ids: Sequence[int] | None = None,
+    streamer=None,
 ) -> list[list[int]]:
     """Generate for a batch of prompts in one ``generate()`` call.
 
     With ``eos_token_ids=None`` every row generates exactly ``max_new_tokens``
     tokens (what the throughput benchmark wants). Returns each row's new
-    tokens, trimmed after its first EOS.
+    tokens, trimmed after its first EOS. ``streamer`` is passed to
+    ``generate()``; the benchmark uses one to timestamp every decode step.
     """
     device = model.device
     width = max(len(p) for p in prompts)
@@ -51,7 +53,7 @@ def hf_static_generate(
         input_ids[i, width - len(p) :] = torch.tensor(p, device=device)
         attention_mask[i, width - len(p) :] = 1
 
-    kwargs = {"max_new_tokens": max_new_tokens, "pad_token_id": pad_token_id}
+    kwargs = {"max_new_tokens": max_new_tokens, "pad_token_id": pad_token_id, "streamer": streamer}
     if eos_token_ids is None:
         kwargs["min_new_tokens"] = max_new_tokens
     else:

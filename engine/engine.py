@@ -90,6 +90,15 @@ class ModelRunner:
         return self.model.compute_logits(hidden[0, -1]).float()
 
     @torch.inference_mode()
+    def prefill_packed(self, slots: SequenceOf[int], prompts: SequenceOf[SequenceOf[int]]) -> torch.Tensor:
+        """Process several fresh prompts in one forward pass; returns next-token logits ``[B, vocab]``."""
+        ctx = self.cache.packed_prefill_context(slots, [len(p) for p in prompts])
+        ids = torch.tensor([[t for p in prompts for t in p]], device=self.device)  # [1, total tokens]
+        hidden = self.model(ids, ctx.positions.unsqueeze(0), ctx)
+        ctx.commit()
+        return self.model.compute_logits(hidden[0, ctx.last_index]).float()
+
+    @torch.inference_mode()
     def decode(self, slots: SequenceOf[int], last_tokens: SequenceOf[int]) -> torch.Tensor:
         """One decode step for many sequences in ONE forward pass; returns logits ``[B, vocab]``.
 
@@ -103,15 +112,35 @@ class ModelRunner:
         return self.model.compute_logits(hidden[:, -1]).float()
 
 
+def pack_by_budget(lengths: SequenceOf[int], budget: int) -> list[list[int]]:
+    """Split items (by index, order kept) into groups whose total length fits ``budget``.
+
+    ``budget <= 0`` puts every item in its own group: one-at-a-time prefill.
+    An item longer than the budget still gets a group of its own.
+    """
+    groups: list[list[int]] = []
+    total = 0
+    for i, n in enumerate(lengths):
+        if groups and budget > 0 and total + n <= budget:
+            groups[-1].append(i)
+            total += n
+        else:
+            groups.append([i])
+            total = n
+    return groups
+
+
 def generate_static(
     runner: ModelRunner,
     prompts: SequenceOf[SequenceOf[int]],
     max_new_tokens: int,
     eos_token_ids: SequenceOf[int] = (),
+    prefill_budget: int = 0,
 ) -> list[list[int]]:
     """Greedy static batching: prefill every prompt, then decode them together until all are done.
 
-    Prompts are prefilled one at a time (each into its own slot). Decoding is
+    Prompts are prefilled one at a time (each into its own slot), or packed
+    into forward passes of up to ``prefill_budget`` tokens. Decoding is
     batched: one forward pass per step for every unfinished sequence. A
     finished sequence drops out of the batch, but its slot stays idle until
     the whole batch is done; nothing new can join. That waiting is what
@@ -127,7 +156,14 @@ def generate_static(
     stop = set(eos_token_ids)
     slots = [cache.allocate() for _ in prompts]
     try:
-        outputs = [[int(runner.prefill(slot, p).argmax())] for slot, p in zip(slots, prompts)]
+        outputs: list[list[int]] = [[] for _ in prompts]
+        for group in pack_by_budget([len(p) for p in prompts], prefill_budget):
+            if len(group) == 1:
+                logits = runner.prefill(slots[group[0]], prompts[group[0]]).unsqueeze(0)
+            else:
+                logits = runner.prefill_packed([slots[i] for i in group], [prompts[i] for i in group])
+            for i, token in zip(group, logits.argmax(dim=-1).tolist()):
+                outputs[i].append(token)
 
         def finished(i: int) -> bool:
             return len(outputs[i]) >= max_new_tokens or outputs[i][-1] in stop
@@ -175,7 +211,8 @@ class LLMEngine:
     """Serves many requests at once with continuous batching.
 
     Every call to :meth:`step` does one scheduler decision, prefills the newly
-    admitted requests (one at a time), then runs ONE batched decode for
+    admitted requests (packed into as few forward passes as the token budget
+    allows), then runs ONE batched decode for
     everything already running. Requests finish and free their slot inside a
     step, and new ones are admitted at the start of the next: the batch
     changes shape every step instead of waiting for its slowest member.
@@ -226,11 +263,21 @@ class LLMEngine:
         batch = self.scheduler.schedule()
         new_tokens: list[tuple[int, int]] = []
 
-        for seq in batch.prefills:
-            logits = self.runner.prefill(seq.slot, seq.prompt_token_ids)
-            token = self.sampler(logits.unsqueeze(0), [seq.sampling])[0]
-            self.scheduler.append_token(seq, token, time.perf_counter())
-            new_tokens.append((seq.seq_id, token))
+        # Prefill the newly admitted requests, packing several prompts into
+        # one forward pass where the token budget allows (or one at a time
+        # if batched prefill is switched off).
+        budget = self.config.max_num_batched_tokens if self.config.batched_prefill else 0
+        for group in pack_by_budget([s.prompt_len for s in batch.prefills], budget):
+            seqs = [batch.prefills[i] for i in group]
+            if len(seqs) == 1:
+                logits = self.runner.prefill(seqs[0].slot, seqs[0].prompt_token_ids).unsqueeze(0)
+            else:
+                logits = self.runner.prefill_packed([s.slot for s in seqs], [s.prompt_token_ids for s in seqs])
+            tokens = self.sampler(logits, [s.sampling for s in seqs])
+            now = time.perf_counter()
+            for seq, token in zip(seqs, tokens):
+                self.scheduler.append_token(seq, token, now)
+                new_tokens.append((seq.seq_id, token))
 
         if batch.decodes:
             logits = self.runner.decode([s.slot for s in batch.decodes], [s.last_token for s in batch.decodes])
