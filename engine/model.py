@@ -211,11 +211,14 @@ class Attention(nn.Module):
         self.qkv_proj = nn.Linear(cfg.hidden_size, cfg.q_size + 2 * cfg.kv_size, bias=cfg.attention_bias)
         self.o_proj = nn.Linear(cfg.q_size, cfg.hidden_size, bias=False)
 
+    def project_qkv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.qkv_proj(x).split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
     def forward(
         self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, ctx: AttentionContext
     ) -> torch.Tensor:
         B, T, _ = x.shape
-        q, k, v = self.qkv_proj(x).split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = self.project_qkv(x)
         q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
