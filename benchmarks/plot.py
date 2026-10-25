@@ -82,7 +82,12 @@ def _setup_line(env: dict, extra: str = "") -> str:
     return f"{env.get('gpu', 'CPU')} · torch {env['torch']} · {extra}".rstrip(" ·")
 
 
-def _plot_lines(ax: plt.Axes, data: dict[str, list[tuple[float, float]]]) -> None:
+def _plot_lines(
+    ax: plt.Axes,
+    data: dict[str, list[tuple[float, float]]],
+    fmt=lambda v: f"{v:.0f} tok/s",
+    labels: dict[str, str] | None = None,
+) -> None:
     """Draw one line per backend and label each line's last point directly.
 
     End labels that would overlap are pushed apart vertically. Call after
@@ -91,15 +96,16 @@ def _plot_lines(ax: plt.Axes, data: dict[str, list[tuple[float, float]]]) -> Non
     ends = []
     for key, points in data.items():
         color, label = BACKEND_STYLE[key]
+        label = (labels or {}).get(key, label)
         xs, ys = zip(*points)
         ax.plot(xs, ys, color=color, linewidth=2, marker="o", markersize=6, label=label)
-        ends.append((xs[-1], ys[-1], f"{label}\n{ys[-1]:.0f} tok/s"))
-    lo, hi = ax.get_ylim()
+        ends.append((xs[-1], ys[-1], f"{label}\n{fmt(ys[-1])}"))
     height_pt = ax.get_window_extent().height * 72 / ax.figure.dpi
     min_gap = 26  # points: two lines of 8.5pt text plus a little air
     placed: list[float] = []  # label centres, in points from the bottom of the axes
+    to_axes = ax.transData + ax.transAxes.inverted()  # data -> 0..1 of the axes (works on log scales too)
     for x, y, text in sorted(ends, key=lambda e: e[1]):
-        y_pt = (y - lo) / (hi - lo) * height_pt
+        y_pt = to_axes.transform((x, y))[1] * height_pt
         label_pt = max([y_pt] + [p + min_gap for p in placed])
         placed.append(label_pt)
         ax.annotate(text, (x, y), xytext=(8, label_pt - y_pt), textcoords="offset points",
@@ -242,20 +248,19 @@ def plot_batch_timeline() -> Path | None:
         "Batch size over time: continuous batching keeps the GPU full",
         _setup_line(runs[0][1]["env"], "same 200 requests, all queued at t=0 · 32 slots"),
     )
-    ends = []
     for key, res in runs:
         t, running = zip(*[(p[0], p[1]) for p in res["timeline"]])
         color, _ = BACKEND_STYLE[key]
-        label = "Continuous batching" if key == "engine" else "Static batching"
+        label = "Continuous" if key == "engine" else "Static"
         ax.step(t, running, where="post", color=color, linewidth=1.6, label=label)
-        ends.append((t[-1], label, res["metrics"]["duration_s"]))
+        # Mark when the last request finished.
+        done = res["metrics"]["duration_s"]
+        ax.axvline(done, color=color, linewidth=1, linestyle=":")
+        ax.text(done - 0.8, 34.5, f"{label} done: {done:.0f} s", color=TEXT, fontsize=8.5, ha="right")
     ax.set_xlabel("Time since start (seconds)", color=TEXT_MUTED, fontsize=10)
     ax.set_ylabel("Requests in the running batch", color=TEXT_MUTED, fontsize=10)
-    ax.set_ylim(0, 36)
-    for x, label, duration in ends:
-        ax.annotate(f"{label}" + NL + f"done at {duration:.0f} s", (x, 0), xytext=(4, 30), textcoords="offset points",
-                    fontsize=8.5, color=TEXT, annotation_clip=False)
-    ax.legend(loc="upper right", frameon=False, fontsize=9, labelcolor=TEXT, bbox_to_anchor=(1.3, 1.0))
+    ax.set_ylim(0, 37)
+    ax.legend(loc="upper left", frameon=False, fontsize=9, labelcolor=TEXT, bbox_to_anchor=(1.0, 1.0))
     return _save(fig, "chart4_batch_timeline.png")
 
 
@@ -272,13 +277,17 @@ def plot_latency_vs_load() -> Path | None:
     if not data or env is None:
         return None
     fig, ax = _new_figure(
-        "Time to first token under load",
+        "Time to first token under load: continuous stays under 0.1 s",
         _setup_line(env["env"], "200 requests, Poisson arrivals · p95 TTFT (includes queueing)"),
     )
-    _plot_lines(ax, data)
+    ax.set_yscale("log")
+    ax.set_ylim(0.02, 400)
+    _plot_lines(ax, data, fmt=lambda v: f"{v:.2f} s" if v < 1 else f"{v:.0f} s",
+                labels={"engine": "My engine, continuous", "engine_static": "My engine, static",
+                        "hf": "HF generate(), static"})
     ax.set_xticks(range(len(rates)), ["2 req/s", "4 req/s", "all at once"])
     ax.set_xlabel("Request arrival rate", color=TEXT_MUTED, fontsize=10)
-    ax.set_ylabel("p95 time to first token (seconds)", color=TEXT_MUTED, fontsize=10)
+    ax.set_ylabel("p95 time to first token (s, log scale)", color=TEXT_MUTED, fontsize=10)
     ax.legend(loc="upper left", frameon=False, fontsize=9, labelcolor=TEXT)
     return _save(fig, "chart5_latency_vs_load.png")
 
