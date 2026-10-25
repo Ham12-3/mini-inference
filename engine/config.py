@@ -48,6 +48,9 @@ class EngineConfig:
             max_num_seqs * max_model_len (what the slot cache needs). For the
             paged cache this sets the block pool size, so a paged engine with
             a larger max_num_seqs can be compared at equal memory.
+        cuda_graphs: Record the decode step as CUDA graphs (one per batch-size
+            and KV-length bucket) and replay them, removing most per-step
+            CPU launch overhead. CUDA only.
         batched_prefill: Pack several new prompts into one prefill forward pass
             (up to max_num_batched_tokens tokens). False prefills one prompt
             per forward pass, the simpler Stage 3/4 behaviour.
@@ -67,6 +70,7 @@ class EngineConfig:
     enable_prefix_caching: bool = False
     kv_cache_tokens: int | None = None
     batched_prefill: bool = True
+    cuda_graphs: bool = False
     seed: int = 0
     debug: bool = False
 
@@ -81,6 +85,8 @@ class EngineConfig:
             raise ValueError(f"scheduling must be 'continuous' or 'static', got {self.scheduling!r}")
         if self.kv_cache not in ("slot", "paged"):
             raise ValueError(f"kv_cache must be 'slot' or 'paged', got {self.kv_cache!r}")
+        if self.cuda_graphs and not self.device.startswith("cuda"):
+            raise ValueError("cuda_graphs needs a CUDA device")
         if self.enable_prefix_caching and self.kv_cache != "paged":
             raise ValueError("prefix caching needs kv_cache='paged'")
         if self.kv_cache_tokens is None:

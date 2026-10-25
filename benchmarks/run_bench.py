@@ -71,13 +71,15 @@ KV_CACHE_TOKENS = 32 * MAX_MODEL_LEN
 
 def run_engine(requests: list[Request], start: float, scheduling: str, max_num_seqs: int, kv_cache: str = "slot",
                prefix_caching: bool = False):
+    cuda_graphs = run_engine.cuda_graphs  # set by main() from --cuda-graphs
     from engine.config import EngineConfig
     from engine.engine import LLMEngine
     from engine.sequence import SamplingParams
 
     engine = LLMEngine(EngineConfig(model=MODEL, max_num_seqs=max_num_seqs, max_model_len=MAX_MODEL_LEN,
                                     max_num_batched_tokens=4096, scheduling=scheduling, kv_cache=kv_cache,
-                                    kv_cache_tokens=KV_CACHE_TOKENS, enable_prefix_caching=prefix_caching))
+                                    kv_cache_tokens=KV_CACHE_TOKENS, enable_prefix_caching=prefix_caching,
+                                    cuda_graphs=cuda_graphs))
     # Warm-up (kernel selection, allocator), then forget it.
     engine.generate([r.prompt_ids for r in requests[:4]], SamplingParams(max_tokens=8, ignore_eos=True))
     engine.step_stats.clear()
@@ -238,7 +240,9 @@ def main() -> None:
     parser.add_argument("--shared-prefix", type=int, default=0,
                         help="every prompt starts with the same N tokens, then 32-128 tokens of its own; "
                              "outputs 16-128 tokens (the prefix-caching workload)")
+    parser.add_argument("--cuda-graphs", action="store_true", help="engine backends: replay the decode step from CUDA graphs")
     args = parser.parse_args()
+    run_engine.cuda_graphs = args.cuda_graphs
 
     from transformers import AutoTokenizer
 
@@ -261,7 +265,8 @@ def main() -> None:
 
     save_results(
         f"bench_{args.backend}_rate{args.rate}" + (f"_seqs{args.max_num_seqs}" if args.max_num_seqs != 32 else "")
-        + (f"_prefix{args.shared_prefix}" if args.shared_prefix else ""),
+        + (f"_prefix{args.shared_prefix}" if args.shared_prefix else "")
+        + ("_graphs" if args.cuda_graphs else ""),
         {
             "backend": args.backend,
             "model": MODEL,
@@ -273,6 +278,7 @@ def main() -> None:
                           "prompt_len": [32, 512], "output_len": "70% in [16,128], 30% in [256,512]",
                           "ignore_eos": True}),
             "max_num_seqs": args.max_num_seqs,
+            "cuda_graphs": args.cuda_graphs,
             "kv_cache_tokens": KV_CACHE_TOKENS if args.backend.startswith("engine") else None,
             "metrics": metrics,
             "timeline": downsample(timeline),

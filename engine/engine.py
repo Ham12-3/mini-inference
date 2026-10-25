@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 
 from engine.config import EngineConfig
+from engine.cuda_graphs import GraphedDecoder
 from engine.kv_cache import PagedKVCache, SingleSequenceKVCache, SlotKVCache
 from engine.loader import load_eos_token_ids, load_model, resolve_model_path
 from engine.model import Qwen2ForCausalLM
@@ -78,6 +79,12 @@ class ModelRunner:
         self.model = model
         self.cache = cache
         self.device = cache.k.device
+        self.graphs: GraphedDecoder | None = None  # set by enable_cuda_graphs()
+
+    def enable_cuda_graphs(self, max_batch: int) -> None:
+        """Record the decode step as CUDA graphs; later decodes replay them when a bucket fits."""
+        self.graphs = GraphedDecoder(self.model, self.cache, max_batch)
+        self.graphs.capture()
 
     @torch.inference_mode()
     def prefill(self, slot: int, prompt_ids: SequenceOf[int]) -> torch.Tensor:
@@ -105,6 +112,10 @@ class ModelRunner:
         ``last_tokens[b]`` is the most recent token of the sequence in
         ``slots[b]``. Each one goes in at its own sequence's position.
         """
+        if self.graphs is not None:
+            logits = self.graphs.decode(slots, last_tokens)
+            if logits is not None:
+                return logits
         ctx = self.cache.decode_context(slots)
         ids = torch.tensor(list(last_tokens), device=self.device).unsqueeze(1)  # [B, 1]
         hidden = self.model(ids, ctx.positions.unsqueeze(1), ctx)
@@ -237,6 +248,8 @@ class LLMEngine:
                 self.model.cfg, config.max_num_seqs, config.max_model_len, config.torch_dtype, config.device
             )
         self.runner = ModelRunner(self.model, self.cache)
+        if config.cuda_graphs:
+            self.runner.enable_cuda_graphs(config.max_num_seqs)
         self.scheduler = Scheduler(config, self.cache, self.eos_token_ids)
         self.sampler = Sampler(config.seed, config.device)
         self.sequences: dict[int, Sequence] = {}

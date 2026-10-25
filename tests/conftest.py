@@ -43,4 +43,12 @@ def chat_prompt_ids(tokenizer):
     return [encode(p) for p in PROMPTS]
 
 
+@pytest.fixture(scope="session")
+def prompts(tokenizer, chat_prompt_ids):
+    """Eight prompts for engine tests: the five parity prompts plus three from the benchmark pool."""
+    from benchmarks.workload import PROMPT_POOL, chat_prompt_ids as encode_chat
+
+    return chat_prompt_ids + encode_chat(tokenizer, PROMPT_POOL[2:5])
+
+
 requires_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")

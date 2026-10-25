@@ -23,7 +23,8 @@ from engine.loader import resolve_model_path
 BatchFn = Callable[[Sequence[Sequence[int]], int], list[list[int]]]
 
 
-def make_engine(model_path: str, dtype: torch.dtype, device: str, max_batch: int, prefill_budget: int = 4096) -> BatchFn:
+def make_engine(model_path: str, dtype: torch.dtype, device: str, max_batch: int, prefill_budget: int = 4096,
+                cuda_graphs: bool = False) -> BatchFn:
     from engine.engine import ModelRunner, generate_static
     from engine.kv_cache import SlotKVCache
     from engine.loader import load_model
@@ -31,6 +32,8 @@ def make_engine(model_path: str, dtype: torch.dtype, device: str, max_batch: int
     model = load_model(model_path, dtype, device)
     cache = SlotKVCache.for_model(model.cfg, num_slots=max_batch, max_len=1024, dtype=dtype, device=device)
     runner = ModelRunner(model, cache)
+    if cuda_graphs:
+        runner.enable_cuda_graphs(max_batch)
     return lambda prompts, n: generate_static(runner, prompts, n, eos_token_ids=(), prefill_budget=prefill_budget)
 
 
@@ -49,7 +52,13 @@ def make_engine_serial_prefill(model_path: str, dtype: torch.dtype, device: str,
     return make_engine(model_path, dtype, device, max_batch, prefill_budget=0)
 
 
-BACKENDS = {"engine": make_engine, "engine_serial_prefill": make_engine_serial_prefill, "hf": make_hf}
+def make_engine_graphs(model_path: str, dtype: torch.dtype, device: str, max_batch: int) -> BatchFn:
+    """Packed prefill plus CUDA-graph decode (Stage 6)."""
+    return make_engine(model_path, dtype, device, max_batch, cuda_graphs=True)
+
+
+BACKENDS = {"engine": make_engine, "engine_serial_prefill": make_engine_serial_prefill,
+            "engine_graphs": make_engine_graphs, "hf": make_hf}
 
 
 def timed(fn: BatchFn, prompts: Sequence[Sequence[int]], n: int) -> float:

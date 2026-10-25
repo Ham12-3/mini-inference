@@ -8,8 +8,6 @@ request's output must still be exactly what it generates when run alone.
 import pytest
 from conftest import DEVICE, requires_gpu
 
-from benchmarks.workload import PROMPT_POOL
-from benchmarks.workload import chat_prompt_ids as encode_chat
 from engine.config import EngineConfig
 from engine.engine import LLMEngine, generate_greedy
 from engine.kv_cache import SingleSequenceKVCache
@@ -53,12 +51,6 @@ def check_engine_matches_single(engine, prompts, max_tokens, arrive_every):
     assert any(s.num_prefills and s.num_decodes for s in stats), "no request ever joined a running batch"
     assert any(s.num_waiting for s in stats), "the queue was never used"
     assert engine.cache.num_free_slots == engine.config.max_num_seqs
-
-
-@pytest.fixture(scope="module")
-def prompts(tokenizer, chat_prompt_ids):
-    """Eight prompts: the five parity prompts plus three from the benchmark pool."""
-    return chat_prompt_ids + encode_chat(tokenizer, PROMPT_POOL[2:5])
 
 
 def test_engine_matches_single_fp32(prompts):

@@ -138,10 +138,13 @@ class SlotKVCache:
         dtype: torch.dtype,
         device: torch.device | str,
     ) -> None:
-        shape = (num_layers, num_slots, num_kv_heads, max_len, head_dim)
+        # One extra "scratch" slot that is never handed out: CUDA-graph
+        # padding rows write there (see engine/cuda_graphs.py).
+        shape = (num_layers, num_slots + 1, num_kv_heads, max_len, head_dim)
         self.k = torch.zeros(shape, dtype=dtype, device=device)
         self.v = torch.zeros(shape, dtype=dtype, device=device)
         self.num_slots = num_slots
+        self.scratch_slot = num_slots
         self.max_len = max_len
         self.lengths = [0] * num_slots
         # A stack of free slot ids; pop() hands out the lowest id first.
@@ -418,10 +421,13 @@ class PagedKVCache:
         device: torch.device | str,
         enable_prefix_caching: bool = False,
     ) -> None:
-        shape = (num_layers, num_blocks, num_kv_heads, block_size, head_dim)
+        # One extra "scratch" block outside the pool: CUDA-graph padding rows
+        # point at it (see engine/cuda_graphs.py).
+        shape = (num_layers, num_blocks + 1, num_kv_heads, block_size, head_dim)
         self.k = torch.zeros(shape, dtype=dtype, device=device)
         self.v = torch.zeros(shape, dtype=dtype, device=device)
         self.num_blocks = num_blocks
+        self.scratch_block = num_blocks
         self.block_size = block_size
         self.max_len = max_len
         self.enable_prefix_caching = enable_prefix_caching
