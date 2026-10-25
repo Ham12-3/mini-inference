@@ -41,6 +41,9 @@ class EngineConfig:
             "paged": a pool of block_size-token blocks handed out as
             sequences grow, so the same memory holds more sequences.
         block_size: Tokens per block in the paged cache.
+        enable_prefix_caching: Paged cache only. Reuse cached blocks when a new
+            prompt starts with tokens already processed (e.g. a shared system
+            prompt), so only the rest is prefilled.
         kv_cache_tokens: Total KV cache capacity in tokens. Defaults to
             max_num_seqs * max_model_len (what the slot cache needs). For the
             paged cache this sets the block pool size, so a paged engine with
@@ -61,6 +64,7 @@ class EngineConfig:
     scheduling: str = "continuous"
     kv_cache: str = "slot"
     block_size: int = 16
+    enable_prefix_caching: bool = False
     kv_cache_tokens: int | None = None
     batched_prefill: bool = True
     seed: int = 0
@@ -77,6 +81,8 @@ class EngineConfig:
             raise ValueError(f"scheduling must be 'continuous' or 'static', got {self.scheduling!r}")
         if self.kv_cache not in ("slot", "paged"):
             raise ValueError(f"kv_cache must be 'slot' or 'paged', got {self.kv_cache!r}")
+        if self.enable_prefix_caching and self.kv_cache != "paged":
+            raise ValueError("prefix caching needs kv_cache='paged'")
         if self.kv_cache_tokens is None:
             self.kv_cache_tokens = self.max_num_seqs * self.max_model_len
         if self.kv_cache_tokens < self.max_model_len:

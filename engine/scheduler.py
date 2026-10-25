@@ -89,11 +89,14 @@ class Scheduler:
             if not self.cache.can_allocate(num_tokens + 1):
                 break
             self.waiting.popleft()
-            seq.slot = self.cache.allocate(num_tokens)
+            # With prefix caching the cache may already hold the start of the
+            # prompt; then lengths[slot] > 0 and only the rest is prefilled.
+            seq.slot = self.cache.allocate(num_tokens, token_ids=seq.token_ids)
+            seq.num_cached_tokens = self.cache.lengths[seq.slot]
             seq.status = SequenceStatus.RUNNING
             self.running.append(seq)
             out.prefills.append(seq)
-            budget -= num_tokens
+            budget -= num_tokens - seq.num_cached_tokens
         return out
 
     def _make_room_for_decodes(self) -> None:

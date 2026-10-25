@@ -205,3 +205,66 @@ def test_paged_decode_attention_matches_per_sequence():
         full_k = torch.cat([k, k_new[b : b + 1]], dim=2)
         full_v = torch.cat([v, v_new[b : b + 1]], dim=2)
         torch.testing.assert_close(out[b : b + 1], sdpa_attention(q[b : b + 1], full_k, full_v), rtol=1e-5, atol=1e-6)
+
+
+def test_prefix_blocks_are_shared_refcounted_and_evicted_lru():
+    cache = PagedKVCache(num_layers=1, num_kv_heads=1, head_dim=4, num_blocks=16, block_size=4, max_seqs=4,
+                         max_len=64, dtype=torch.float32, device="cpu", enable_prefix_caching=True)
+    shared = list(range(100, 116))  # 16 tokens = 4 full blocks
+    a_tokens = shared + [1, 2, 3]
+    a = cache.allocate(len(a_tokens), token_ids=a_tokens)
+    assert cache.lengths[a] == 0  # nothing cached yet
+    cache.lengths[a] = len(a_tokens)  # pretend it was prefilled
+    cache.register_prefix(a, a_tokens)
+
+    b_tokens = shared + [7, 8]
+    b = cache.allocate(len(b_tokens), token_ids=b_tokens)
+    assert cache.lengths[b] == 16  # 4 shared blocks: only 2 tokens left to prefill
+    assert cache.block_tables[b][:4] == cache.block_tables[a][:4]
+    assert cache.block_tables[b][4] != cache.block_tables[a][4]
+
+    # A prompt that IS exactly the shared tokens still computes its last block.
+    c = cache.allocate(16, token_ids=shared)
+    assert cache.lengths[c] == 12
+
+    cache.free(a)
+    cache.free(b)
+    cache.free(c)
+    assert cache.num_free_blocks == 16
+    d = cache.allocate(18, token_ids=shared + [5, 6])  # cached blocks survive in the free pool
+    assert cache.lengths[d] == 16
+    cache.free(d)
+
+    # Use up the pool with unrelated data: the cached blocks get evicted (last).
+    e = cache.allocate(64, token_ids=list(range(64)))
+    cache.free(e)
+    f = cache.allocate(18, token_ids=shared + [5, 6])
+    assert cache.lengths[f] == 0
+
+
+@torch.inference_mode()
+def test_prefill_on_cached_prefix_matches_full_prefill(model_dir, tokenizer):
+    model = load_model(str(model_dir), torch.float32, DEVICE)
+    system = "You are a careful assistant. Answer briefly and precisely. " * 6
+    prompts = [tokenizer.apply_chat_template([{"role": "system", "content": system}, {"role": "user", "content": q}],
+                                             tokenize=False, add_generation_prompt=True)
+               for q in ("What is a CPU cache?", "Name three rivers.", "Why is the sky blue?")]
+    ids = [tokenizer(p).input_ids for p in prompts]
+
+    def paged(prefix_caching):
+        cache = PagedKVCache.for_model(model.cfg, num_blocks=64, block_size=16, max_seqs=4, max_len=512,
+                                       dtype=torch.float32, device=DEVICE, enable_prefix_caching=prefix_caching)
+        return ModelRunner(model, cache)
+
+    ref_runner = paged(False)
+    ref = ref_runner.prefill_packed([ref_runner.cache.allocate(len(p)) for p in ids], ids)
+
+    runner = paged(True)
+    first = runner.cache.allocate(len(ids[0]), token_ids=ids[0])
+    runner.prefill_packed([first], [ids[0]])
+    runner.cache.register_prefix(first, ids[0])
+    slots = [runner.cache.allocate(len(p), token_ids=p) for p in ids[1:]]
+    starts = [runner.cache.lengths[s] for s in slots]
+    assert all(start >= 64 for start in starts), starts  # the system prompt was found
+    got = runner.prefill_packed(slots, [p[start:] for p, start in zip(ids[1:], starts)])  # two prefixes, packed
+    torch.testing.assert_close(got, ref[1:], rtol=1e-4, atol=1e-3)

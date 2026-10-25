@@ -10,6 +10,7 @@ Backends:
     engine_static      my engine, a new batch only when the previous one is done
     engine_continuous  my engine, continuous batching
     engine_paged       my engine, continuous batching with the paged KV cache (same memory)
+    engine_paged_prefix  the same with prefix caching (use with --shared-prefix)
 
 Every backend serves the same requests (same prompts, same output lengths,
 EOS ignored) in the same way: a request can only start after its arrival
@@ -68,14 +69,15 @@ def wait_until(t: float) -> None:
 KV_CACHE_TOKENS = 32 * MAX_MODEL_LEN
 
 
-def run_engine(requests: list[Request], start: float, scheduling: str, max_num_seqs: int, kv_cache: str = "slot"):
+def run_engine(requests: list[Request], start: float, scheduling: str, max_num_seqs: int, kv_cache: str = "slot",
+               prefix_caching: bool = False):
     from engine.config import EngineConfig
     from engine.engine import LLMEngine
     from engine.sequence import SamplingParams
 
     engine = LLMEngine(EngineConfig(model=MODEL, max_num_seqs=max_num_seqs, max_model_len=MAX_MODEL_LEN,
                                     max_num_batched_tokens=4096, scheduling=scheduling, kv_cache=kv_cache,
-                                    kv_cache_tokens=KV_CACHE_TOKENS))
+                                    kv_cache_tokens=KV_CACHE_TOKENS, enable_prefix_caching=prefix_caching))
     # Warm-up (kernel selection, allocator), then forget it.
     engine.generate([r.prompt_ids for r in requests[:4]], SamplingParams(max_tokens=8, ignore_eos=True))
     engine.step_stats.clear()
@@ -102,6 +104,7 @@ def run_engine(requests: list[Request], start: float, scheduling: str, max_num_s
         records.append(Record(s.arrival_time, s.first_token_time, s.finish_time, len(s.output_token_ids)))
     timeline = [(st.time - start, st.num_running, st.num_waiting) for st in engine.step_stats]
     run_engine.num_preemptions = engine.scheduler.num_preemptions  # reported by main()
+    run_engine.prefix_hit_tokens = getattr(engine.cache, "prefix_hit_tokens", 0)
     return start, records, timeline
 
 
@@ -185,6 +188,8 @@ BACKENDS = {
     # Same KV memory as the slot cache, handed out in 16-token blocks; use a
     # larger --max-num-seqs to let more sequences run at once.
     "engine_paged": lambda reqs, start, n: run_engine(reqs, start, "continuous", n, kv_cache="paged"),
+    "engine_paged_prefix": lambda reqs, start, n: run_engine(reqs, start, "continuous", n, kv_cache="paged",
+                                                             prefix_caching=True),
 }
 
 
@@ -230,13 +235,20 @@ def main() -> None:
     parser.add_argument("--num-requests", type=int, default=200)
     parser.add_argument("--max-num-seqs", type=int, default=32)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--shared-prefix", type=int, default=0,
+                        help="every prompt starts with the same N tokens, then 32-128 tokens of its own; "
+                             "outputs 16-128 tokens (the prefix-caching workload)")
     args = parser.parse_args()
 
     from transformers import AutoTokenizer
 
     rate = None if args.rate == "inf" else float(args.rate)
     tok = AutoTokenizer.from_pretrained(resolve_model_path(MODEL))
-    requests = make_workload(tok, num_requests=args.num_requests, seed=args.seed, rate=rate)
+    if args.shared_prefix:
+        requests = make_workload(tok, num_requests=args.num_requests, seed=args.seed, rate=rate,
+                                 shared_prefix_len=args.shared_prefix, prompt_len=(32, 128), long_fraction=0.0)
+    else:
+        requests = make_workload(tok, num_requests=args.num_requests, seed=args.seed, rate=rate)
 
     start, records, timeline = BACKENDS[args.backend](requests, time.perf_counter(), args.max_num_seqs)
     metrics = summarize(records, start)
@@ -244,17 +256,22 @@ def main() -> None:
         metrics["max_concurrent_seqs"] = max(running for _, running, _ in timeline)
     if args.backend.startswith("engine"):
         metrics["preemptions"] = run_engine.num_preemptions
+        metrics["prefix_hit_tokens"] = run_engine.prefix_hit_tokens
     print(" ".join(f"{k}={v}" for k, v in metrics.items()))
 
     save_results(
-        f"bench_{args.backend}_rate{args.rate}" + (f"_seqs{args.max_num_seqs}" if args.max_num_seqs != 32 else ""),
+        f"bench_{args.backend}_rate{args.rate}" + (f"_seqs{args.max_num_seqs}" if args.max_num_seqs != 32 else "")
+        + (f"_prefix{args.shared_prefix}" if args.shared_prefix else ""),
         {
             "backend": args.backend,
             "model": MODEL,
             "dtype": "float16",
-            "workload": {"num_requests": args.num_requests, "seed": args.seed, "rate": args.rate,
-                         "prompt_len": [32, 512], "output_len": "70% in [16,128], 30% in [256,512]",
-                         "ignore_eos": True},
+            "workload": ({"num_requests": args.num_requests, "seed": args.seed, "rate": args.rate,
+                          "shared_prefix_len": args.shared_prefix, "own_prompt_len": [32, 128],
+                          "output_len": [16, 128], "ignore_eos": True} if args.shared_prefix else
+                         {"num_requests": args.num_requests, "seed": args.seed, "rate": args.rate,
+                          "prompt_len": [32, 512], "output_len": "70% in [16,128], 30% in [256,512]",
+                          "ignore_eos": True}),
             "max_num_seqs": args.max_num_seqs,
             "kv_cache_tokens": KV_CACHE_TOKENS if args.backend.startswith("engine") else None,
             "metrics": metrics,

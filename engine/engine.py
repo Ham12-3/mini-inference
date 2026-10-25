@@ -230,7 +230,7 @@ class LLMEngine:
             self.cache = PagedKVCache.for_model(
                 self.model.cfg, num_blocks=config.kv_cache_tokens // config.block_size, block_size=config.block_size,
                 max_seqs=config.max_num_seqs, max_len=config.max_model_len, dtype=config.torch_dtype,
-                device=config.device,
+                device=config.device, enable_prefix_caching=config.enable_prefix_caching,
             )
         else:
             self.cache = SlotKVCache.for_model(
@@ -274,11 +274,15 @@ class LLMEngine:
         # one forward pass where the token budget allows (or one at a time
         # if batched prefill is switched off).
         # A request that was preempted earlier recomputes its prompt plus the
-        # tokens it had already generated (token_ids), then continues.
+        # tokens it had already generated (token_ids), then continues. Tokens
+        # already in the cache (a prefix-cache hit) are skipped.
         budget = self.config.max_num_batched_tokens if self.config.batched_prefill else 0
-        for group in pack_by_budget([s.num_tokens for s in batch.prefills], budget):
+        new_tokens_of = {s.seq_id: s.token_ids[self.cache.lengths[s.slot]:] for s in batch.prefills}
+        for group in pack_by_budget([len(new_tokens_of[s.seq_id]) for s in batch.prefills], budget):
             seqs = [batch.prefills[i] for i in group]
-            logits = self.runner.prefill_packed([s.slot for s in seqs], [s.token_ids for s in seqs])
+            logits = self.runner.prefill_packed([s.slot for s in seqs], [new_tokens_of[s.seq_id] for s in seqs])
+            for s in seqs:
+                self.cache.register_prefix(s.slot, s.token_ids)
             tokens = self.sampler(logits, [s.sampling for s in seqs])
             now = time.perf_counter()
             for seq, token in zip(seqs, tokens):

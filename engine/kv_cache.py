@@ -11,6 +11,7 @@ Each class here implements :class:`engine.model.AttentionContext`.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Sequence
 
 import torch
@@ -160,8 +161,12 @@ class SlotKVCache:
         """Is there room for a new sequence of ``num_tokens``? (A free slot, and it fits in one.)"""
         return bool(self._free) and num_tokens <= self.max_len
 
-    def allocate(self, num_tokens: int = 0) -> int:
-        """Hand out a free slot (its length starts at 0). Every slot already holds ``max_len`` tokens."""
+    def allocate(self, num_tokens: int = 0, token_ids: Sequence[int] | None = None) -> int:
+        """Hand out a free slot (its length starts at 0). Every slot already holds ``max_len`` tokens.
+
+        ``token_ids`` is accepted for interface compatibility with the paged
+        cache (which can reuse cached prefixes); the slot cache ignores it.
+        """
         if not self.can_allocate(num_tokens):
             raise RuntimeError("no free KV cache slots" if not self._free else f"{num_tokens} tokens exceed max_len")
         slot = self._free.pop()
@@ -172,12 +177,17 @@ class SlotKVCache:
         """Can ``slot`` hold ``num_tokens`` tokens? A slot never grows, so this is a bounds check."""
         return num_tokens <= self.max_len
 
-    def write_index(self, slots: Sequence[int], lengths: Sequence[int]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Where tokens 0..n-1 of each slot live: ``(slot, position)`` per token, for scattering k/v."""
+    def register_prefix(self, slot: int, token_ids: Sequence[int]) -> None:
+        """No prefix caching in the slot cache (kept so both caches share one interface)."""
+
+    def write_index(
+        self, slots: Sequence[int], starts: Sequence[int], counts: Sequence[int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Where tokens ``start..start+count-1`` of each slot live: ``(slot, position)`` per token."""
         device = self.k.device
         token_slots = torch.repeat_interleave(torch.tensor(list(slots), device=device),
-                                              torch.tensor(list(lengths), device=device))
-        positions = torch.cat([torch.arange(n, device=device) for n in lengths])
+                                              torch.tensor(list(counts), device=device))
+        positions = torch.cat([torch.arange(a, a + n, device=device) for a, n in zip(starts, counts)])
         return token_slots, positions
 
     def free(self, slot: int) -> None:
@@ -226,43 +236,66 @@ class PackedPrefillContext:
     Works with both caches: each cache says where token i of a sequence
     lives (``write_index``): (slot, position) in the slot cache, (block,
     offset in block) in the paged cache.
+
+    A sequence may already have tokens in the cache (a prefix-cache hit, see
+    :class:`PagedKVCache`). Then only its *new* tokens are packed, at
+    positions ``start..start+n-1``, and they must also see the cached prefix,
+    which is not part of this forward pass. In that case we write the new
+    k/v first, read every sequence's keys ``0..start+n-1`` back from the
+    cache, and use a mask that lets each token see its own sequence's keys up
+    to its own position.
     """
 
     def __init__(self, cache: SlotKVCache | PagedKVCache, slots: Sequence[int], lengths: Sequence[int]) -> None:
         self.cache = cache
         self.slots = list(slots)
-        self.lengths = list(lengths)
-        if any(cache.lengths[s] != 0 for s in self.slots):
-            raise ValueError("packed prefill only handles fresh prompts (slot length 0)")
-        for s, n in zip(self.slots, self.lengths):
-            if not cache.ensure_capacity(s, n):
-                raise ValueError(f"no room in the KV cache for a {n}-token prompt")
+        self.lengths = list(lengths)  # new tokens per sequence
+        self.starts = [cache.lengths[s] for s in self.slots]  # tokens each sequence already has cached
+        for s, start, n in zip(self.slots, self.starts, self.lengths):
+            if not cache.ensure_capacity(s, start + n):
+                raise ValueError(f"no room in the KV cache for {start + n} tokens")
         device = cache.k.device
         # Per packed token: which prompt it belongs to, and its position in that prompt.
         seg = torch.repeat_interleave(torch.arange(len(self.slots), device=device),
                                       torch.tensor(self.lengths, device=device))
-        self.positions = torch.cat([torch.arange(n, device=device) for n in self.lengths])
-        self.write_at = cache.write_index(self.slots, self.lengths)
-        index = torch.arange(len(seg), device=device)
-        # One prompt alone needs no special mask: plain causal attention.
-        self.mask = None if len(self.slots) == 1 else (
-            (seg.unsqueeze(1) == seg.unsqueeze(0)) & (index.unsqueeze(0) <= index.unsqueeze(1)))
-        # Index of each prompt's last token: its logits predict the first output token.
+        self.positions = torch.cat([torch.arange(start, start + n, device=device)
+                                    for start, n in zip(self.starts, self.lengths)])
+        self.write_at = cache.write_index(self.slots, self.starts, self.lengths)
+        self.has_prefix = any(self.starts)
+        if self.has_prefix:
+            ends = [start + n for start, n in zip(self.starts, self.lengths)]
+            self.read_at = cache.write_index(self.slots, [0] * len(self.slots), ends)  # keys 0..end-1 per sequence
+            key_seg = torch.repeat_interleave(torch.arange(len(self.slots), device=device),
+                                              torch.tensor(ends, device=device))
+            key_pos = torch.cat([torch.arange(e, device=device) for e in ends])
+            self.mask = (seg.unsqueeze(1) == key_seg.unsqueeze(0)) & (key_pos.unsqueeze(0) <= self.positions.unsqueeze(1))
+        elif len(self.slots) == 1:
+            self.mask = None  # one fresh prompt alone: plain causal attention
+        else:
+            index = torch.arange(len(seg), device=device)
+            self.mask = (seg.unsqueeze(1) == seg.unsqueeze(0)) & (index.unsqueeze(0) <= index.unsqueeze(1))
+        # Index of each prompt's last token: its logits predict the next output token.
         self.last_index = torch.tensor(self.lengths, device=device).cumsum(0) - 1
 
     def attend(self, layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         # Scatter every packed token's k/v to where the cache keeps it, in one write.
         # k[0] is [heads, N, head_dim]; the indexed target is [N, heads, head_dim].
+        k_layer, v_layer = self.cache.k[layer_idx], self.cache.v[layer_idx]
         where_0, where_2 = self.write_at
-        self.cache.k[layer_idx][where_0, :, where_2] = k[0].transpose(0, 1)
-        self.cache.v[layer_idx][where_0, :, where_2] = v[0].transpose(0, 1)
+        k_layer[where_0, :, where_2] = k[0].transpose(0, 1)
+        v_layer[where_0, :, where_2] = v[0].transpose(0, 1)
+        if self.has_prefix:
+            read_0, read_2 = self.read_at
+            keys = k_layer[read_0, :, read_2].transpose(0, 1).unsqueeze(0)  # [1, heads, total keys, head_dim]
+            values = v_layer[read_0, :, read_2].transpose(0, 1).unsqueeze(0)
+            return sdpa_attention(q, keys, values, attn_mask=self.mask)
         if self.mask is None:
             return sdpa_attention(q, k, v, is_causal=True)
         return sdpa_attention(q, k, v, attn_mask=self.mask)
 
     def commit(self) -> None:
-        for slot, n in zip(self.slots, self.lengths):
-            self.cache.lengths[slot] = n
+        for slot, start, n in zip(self.slots, self.starts, self.lengths):
+            self.cache.lengths[slot] = start + n
 
 
 class SlotPrefillContext:
@@ -356,6 +389,18 @@ class PagedKVCache:
     When the pool runs out, the scheduler preempts a sequence (see
     ``Scheduler.schedule``).
 
+    **Prefix caching** (``enable_prefix_caching``): a full block's keys and
+    values depend only on the tokens in it and every token before it. So a
+    full block can be named by its content: a key made of its tokens plus the
+    key of the block before it. After a prompt is prefilled, its full blocks
+    are registered under those keys. A later prompt that starts with the same
+    tokens (a shared system prompt, say) finds the matching blocks and
+    *shares* them instead of recomputing them: it only prefills the rest.
+    Blocks are reference counted. When nobody uses a cached block any more it
+    goes back to the free pool but keeps its contents and key, so it can still
+    be reused, until the pool needs it for new data (the least recently freed
+    blocks are reused first).
+
     Sequences are still identified by a "slot" id, so the engine and scheduler
     treat both caches the same way; here a slot id just names a block table.
     """
@@ -371,6 +416,7 @@ class PagedKVCache:
         max_len: int,
         dtype: torch.dtype,
         device: torch.device | str,
+        enable_prefix_caching: bool = False,
     ) -> None:
         shape = (num_layers, num_blocks, num_kv_heads, block_size, head_dim)
         self.k = torch.zeros(shape, dtype=dtype, device=device)
@@ -378,16 +424,23 @@ class PagedKVCache:
         self.num_blocks = num_blocks
         self.block_size = block_size
         self.max_len = max_len
+        self.enable_prefix_caching = enable_prefix_caching
         self.lengths: dict[int, int] = {}  # slot id -> tokens stored
         self.block_tables: dict[int, list[int]] = {}  # slot id -> its blocks, in token order
-        self._free_blocks = list(range(num_blocks - 1, -1, -1))
         self._free_ids = list(range(max_seqs - 1, -1, -1))
+        # Free blocks in reuse order (oldest first). An ordered dict gives
+        # O(1) "take the oldest" and O(1) "take back this particular one".
+        self._free_blocks: OrderedDict[int, None] = OrderedDict((b, None) for b in range(num_blocks))
+        self._ref_counts = [0] * num_blocks
+        self._block_key: dict[int, tuple] = {}  # block -> its content key (cached blocks only)
+        self._cached: dict[tuple, int] = {}  # content key -> block
+        self.prefix_hit_tokens = 0  # total prompt tokens served from the cache
 
     @classmethod
     def for_model(cls, cfg: Qwen2Config, num_blocks: int, block_size: int, max_seqs: int, max_len: int,
-                  dtype: torch.dtype, device: torch.device | str) -> PagedKVCache:
+                  dtype: torch.dtype, device: torch.device | str, enable_prefix_caching: bool = False) -> PagedKVCache:
         return cls(cfg.num_layers, cfg.num_kv_heads, cfg.head_dim, num_blocks, block_size, max_seqs, max_len,
-                   dtype, device)
+                   dtype, device, enable_prefix_caching)
 
     @property
     def num_free_slots(self) -> int:
@@ -401,16 +454,84 @@ class PagedKVCache:
         return -(-num_tokens // self.block_size)  # ceiling division
 
     def can_allocate(self, num_tokens: int) -> bool:
+        # Conservative: does not count blocks a prefix hit would share.
         return bool(self._free_ids) and num_tokens <= self.max_len and self.blocks_for(num_tokens) <= self.num_free_blocks
 
-    def allocate(self, num_tokens: int = 0) -> int:
-        """Start a new sequence with enough blocks for ``num_tokens`` tokens."""
+    # ------------------------------------------------------------------ blocks
+
+    def _new_block(self) -> int:
+        """Take the least recently freed block; if it held a cached prefix, forget that prefix."""
+        block, _ = self._free_blocks.popitem(last=False)
+        key = self._block_key.pop(block, None)
+        if key is not None:
+            del self._cached[key]
+        self._ref_counts[block] = 1
+        return block
+
+    def _share(self, block: int) -> None:
+        if self._ref_counts[block] == 0:
+            del self._free_blocks[block]  # free but still cached: take it back out of the pool
+        self._ref_counts[block] += 1
+
+    def _release(self, block: int) -> None:
+        self._ref_counts[block] -= 1
+        if self._ref_counts[block] == 0:
+            self._free_blocks[block] = None  # newest at the end: reused last
+            if block not in self._block_key:
+                # Nothing worth keeping in it, so hand it out before any cached block.
+                self._free_blocks.move_to_end(block, last=False)
+
+    @staticmethod
+    def _chain_keys(token_ids: Sequence[int], block_size: int, num_blocks: int):
+        """Content keys of the first ``num_blocks`` full blocks: (hash of the previous key, this block's tokens)."""
+        parent = None
+        for i in range(num_blocks):
+            key = (parent, tuple(token_ids[i * block_size : (i + 1) * block_size]))
+            yield key
+            parent = hash(key)
+
+    def _match_prefix(self, token_ids: Sequence[int]) -> list[int]:
+        # Keep at least one token to compute: its logits pick the next token.
+        usable = (len(token_ids) - 1) // self.block_size
+        blocks = []
+        for key in self._chain_keys(token_ids, self.block_size, usable):
+            block = self._cached.get(key)
+            if block is None:
+                break
+            blocks.append(block)
+        return blocks
+
+    # ------------------------------------------------------------------ sequences
+
+    def allocate(self, num_tokens: int = 0, token_ids: Sequence[int] | None = None) -> int:
+        """Start a new sequence with room for ``num_tokens`` tokens.
+
+        With prefix caching and ``token_ids``, leading full blocks already in
+        the cache are shared, and ``lengths[slot]`` starts at the number of
+        tokens they hold, so the caller only prefills the rest.
+        """
         if not self.can_allocate(num_tokens):
             raise RuntimeError("not enough free KV cache blocks")
+        shared = self._match_prefix(token_ids) if self.enable_prefix_caching and token_ids else []
+        for block in shared:
+            self._share(block)
         slot = self._free_ids.pop()
-        self.lengths[slot] = 0
-        self.block_tables[slot] = [self._free_blocks.pop() for _ in range(self.blocks_for(num_tokens))]
+        fresh = [self._new_block() for _ in range(self.blocks_for(num_tokens) - len(shared))]
+        self.block_tables[slot] = shared + fresh
+        self.lengths[slot] = len(shared) * self.block_size
+        self.prefix_hit_tokens += self.lengths[slot]
         return slot
+
+    def register_prefix(self, slot: int, token_ids: Sequence[int]) -> None:
+        """Make ``slot``'s full blocks findable by later prompts (call after they are filled)."""
+        if not self.enable_prefix_caching:
+            return
+        table = self.block_tables[slot]
+        full_blocks = self.lengths[slot] // self.block_size
+        for i, key in enumerate(self._chain_keys(token_ids, self.block_size, full_blocks)):
+            if key not in self._cached and table[i] not in self._block_key:
+                self._cached[key] = table[i]
+                self._block_key[table[i]] = key
 
     def ensure_capacity(self, slot: int, num_tokens: int) -> bool:
         """Grow ``slot``'s block table to hold ``num_tokens`` tokens. False if the pool is out of blocks."""
@@ -420,23 +541,26 @@ class PagedKVCache:
         missing = self.blocks_for(num_tokens) - len(table)
         if missing > self.num_free_blocks:
             return False
-        table.extend(self._free_blocks.pop() for _ in range(missing))
+        table.extend(self._new_block() for _ in range(missing))
         return True
 
     def free(self, slot: int) -> None:
-        """Give all of a sequence's blocks back to the pool."""
+        """Release a sequence's blocks (blocks shared with other sequences stay in use)."""
         if slot not in self.block_tables:
             raise RuntimeError(f"slot {slot} freed twice")
-        self._free_blocks.extend(reversed(self.block_tables.pop(slot)))
+        for block in reversed(self.block_tables.pop(slot)):
+            self._release(block)
         del self.lengths[slot]
         self._free_ids.append(slot)
 
-    def write_index(self, slots: Sequence[int], lengths: Sequence[int]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Where tokens 0..n-1 of each sequence live: ``(block, offset in block)`` per token."""
+    def write_index(
+        self, slots: Sequence[int], starts: Sequence[int], counts: Sequence[int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Where tokens ``start..start+count-1`` of each sequence live: ``(block, offset in block)``."""
         device = self.k.device
         blocks, offsets = [], []
-        for slot, n in zip(slots, lengths):
-            pos = torch.arange(n, device=device)
+        for slot, a, n in zip(slots, starts, counts):
+            pos = torch.arange(a, a + n, device=device)
             table = torch.tensor(self.block_tables[slot], device=device)
             blocks.append(table[pos // self.block_size])
             offsets.append(pos % self.block_size)

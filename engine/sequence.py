@@ -76,6 +76,7 @@ class Sequence:
     first_token_time: float | None = None
     finish_time: float | None = None
     num_preemptions: int = 0  # times it lost its cache space and had to recompute (paged cache)
+    num_cached_tokens: int = 0  # prompt tokens found in the prefix cache at its last admission
 
     @property
     def prompt_len(self) -> int:

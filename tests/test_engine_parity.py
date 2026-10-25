@@ -105,6 +105,25 @@ def test_engine_paged_matches_single_fp16(prompts):
     check_engine_matches_single(engine, prompts, [50, 20, 64, 35, 50, 28, 60, 40], arrive_every=7)
 
 
+def test_engine_prefix_caching_matches_single(tokenizer):
+    """Prompts sharing a long system prompt reuse its cached blocks and still match running alone."""
+    system = "You are a careful assistant. Answer briefly and precisely. " * 6
+    questions = ["What is a CPU cache?", "Name three rivers.", "Why is the sky blue?", "What is 12 times 12?",
+                 "Give a synonym for happy.", "What does TCP stand for?"]
+    prompts = [tokenizer(tokenizer.apply_chat_template(
+        [{"role": "system", "content": system}, {"role": "user", "content": q}], tokenize=False,
+        add_generation_prompt=True)).input_ids for q in questions]
+    cfg = EngineConfig(device=DEVICE, dtype="float32", max_num_seqs=3, max_model_len=512, max_num_batched_tokens=1024,
+                       kv_cache="paged", block_size=16, enable_prefix_caching=True)
+    engine = LLMEngine(cfg)
+    check_engine_matches_single(engine, prompts, [12, 16, 8, 14, 10, 12], arrive_every=3)
+    # Three requests arrive at step 0 (two at start, one on the step-0 tick)
+    # and are prefilled together, so nothing is cached for them yet. The other
+    # three each reuse every full block of the common prefix.
+    common = next(i for i, toks in enumerate(zip(*prompts)) if len(set(toks)) > 1)
+    assert engine.cache.prefix_hit_tokens == (len(prompts) - 3) * (common // 16) * 16
+
+
 def test_rejects_prompt_longer_than_max_model_len():
     cfg = EngineConfig(device=DEVICE, dtype="float32", max_num_seqs=2, max_model_len=64, max_num_batched_tokens=64)
     engine = LLMEngine(cfg)

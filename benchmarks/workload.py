@@ -58,6 +58,7 @@ def make_workload(
     long_output: tuple[int, int] = (256, 512),
     long_fraction: float = 0.3,
     rate: float | None = None,
+    shared_prefix_len: int = 0,
 ) -> list[Request]:
     """Build a reproducible list of requests.
 
@@ -74,6 +75,10 @@ def make_workload(
     arrivals are exponential (a Poisson process), the usual model for
     independent users. ``None`` means everything arrives at time 0 (an
     offline batch job, which measures peak throughput).
+
+    ``shared_prefix_len`` > 0 starts every prompt with the same tokens (like a
+    long system prompt shared by all users); ``prompt_len`` then sets the
+    length of each request's own part after it.
     """
     rng = random.Random(seed)
     corpus: list[int] = []
@@ -81,6 +86,7 @@ def make_workload(
     while len(corpus) < prompt_len[1] * 4:
         corpus += tokenizer(text).input_ids
 
+    shared = corpus[:shared_prefix_len]
     requests, t = [], 0.0
     for _ in range(num_requests):
         n_prompt = rng.randint(*prompt_len)
@@ -88,5 +94,5 @@ def make_workload(
         n_out = rng.randint(*long_output) if rng.random() < long_fraction else rng.randint(*short_output)
         if rate is not None:
             t += rng.expovariate(rate)
-        requests.append(Request(corpus[start : start + n_prompt], n_out, t))
+        requests.append(Request(shared + corpus[start : start + n_prompt], n_out, t))
     return requests
