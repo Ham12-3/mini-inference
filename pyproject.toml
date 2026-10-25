@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-inference-engine"
+version = "0.1.0"
+description = "A small LLM inference engine (nano-vLLM style): own Qwen2 model, KV cache, scheduler and continuous batching."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Abdulhamid Sonaike" }]
+license = { text = "MIT" }
+# The engine itself only needs these. Benchmark, server and test extras are below.
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.45",
+    "safetensors>=0.4",
+    "huggingface_hub>=0.23",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+bench = ["accelerate>=0.30", "matplotlib>=3.7"]
+api = ["fastapi>=0.110", "uvicorn>=0.29"]
+dev = ["pytest>=7.4"]
+
+[tool.setuptools.packages.find]
+include = ["engine*", "baselines*", "benchmarks*", "api*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["gpu: needs a CUDA GPU"]
