@@ -92,14 +92,47 @@ def test_fp32_cached_decode_logits_match(fp32_models, chat_prompt_ids, model_dir
 @requires_gpu
 @torch.inference_mode()
 def test_fp16_greedy_matches_hf_generate(model_dir, chat_prompt_ids):
+    """Greedy fp16 generation must match HF token for token, except at genuine fp16 ties.
+
+    Two correct fp16 implementations do not produce bit-identical logits:
+    different (but equivalent) kernels round differently, by a few hundredths
+    of a logit. If the top two tokens are closer than that, the two
+    implementations can pick different ones, and after that the texts differ.
+
+    So when a prompt diverges we re-run both models on the shared prefix and
+    accept the divergence only if my gap between the two tokens is smaller
+    than the measured HF-vs-mine logit difference at that very step. A real
+    bug shows up as a clear gap and fails.
+    """
     hf = load_hf(model_dir, torch.float16)
     mine = load_model(str(model_dir), torch.float16, "cuda")
     eos = load_eos_token_ids(model_dir)
     cache = SingleSequenceKVCache.for_model(mine.cfg, max_len=1024, dtype=torch.float16, device="cuda")
 
+    identical, ties = 0, []
     for i, prompt in enumerate(chat_prompt_ids):
         ids = torch.tensor([prompt], device="cuda")
         ref = hf_greedy(hf, ids, NUM_TOKENS, eos)
         assert len(ref) == NUM_TOKENS, f"prompt {i} hit EOS after {len(ref)} tokens; pick a longer-answer prompt"
         got = generate_greedy(mine, prompt, NUM_TOKENS, cache, eos_token_ids=eos)
-        assert got == ref, f"prompt {i}: first mismatch at token {next(j for j, (a, b) in enumerate(zip(got + [-1], ref + [-1])) if a != b)}"
+        if got == ref:
+            identical += 1
+            continue
+
+        t = next(j for j, (a, b) in enumerate(zip(got, ref)) if a != b)
+        prefix = torch.tensor([prompt + ref[:t]], device="cuda")
+        hf_logits = hf(input_ids=prefix).logits[0, -1].float()
+        positions = torch.arange(prefix.shape[1], device="cuda").unsqueeze(0)
+        my_logits = mine.compute_logits(mine(prefix, positions, NoCache())[0, -1]).float()
+        noise = (hf_logits - my_logits).abs().max().item()
+        gap = (my_logits[got[t]] - my_logits[ref[t]]).abs().item()
+        assert gap <= noise, (
+            f"prompt {i}, token {t}: mine={got[t]} hf={ref[t]} with a logit gap of {gap:.4f}, "
+            f"larger than fp16 noise {noise:.4f}: a real mismatch"
+        )
+        ties.append(f"prompt {i}: identical for {t} tokens, then a tie (gap {gap:.4f} <= noise {noise:.4f})")
+
+    print(f"
+{identical}/{len(chat_prompt_ids)} prompts identical for {NUM_TOKENS} tokens")
+    for line in ties:
+        print("  " + line)
